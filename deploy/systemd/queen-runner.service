@@ -1,0 +1,25 @@
+[Unit]
+Description=QueenUI headless game and engine runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/queen-runner
+Environment=QUEEN_RUNNER_LISTEN=127.0.0.1:7788
+Environment=QUEEN_RUNNER_DATA_DIR=%h/.local/share/queenui-runner
+EnvironmentFile=-%h/.config/queenui-runner/environment
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/queenui-runner
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=default.target

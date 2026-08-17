@@ -1,0 +1,162 @@
+name: Windows CI and installers
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  # Never cancel an in-flight tagged release build mid-publish.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  checks-linux:
+    name: Fast checks on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Set up Rust
+        # rust-toolchain.toml pins the channel and components for rustup.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.48.1
+          fallback: none
+
+      - name: Install Tauri Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Audit npm dependencies
+        run: npm audit --audit-level=high
+
+      - name: Verify formatting, lints, tests, and builds
+        run: just ci
+
+  build-windows:
+    name: Verify, package, and install on Windows
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.48.1
+          fallback: none
+
+      - name: Verify tagged version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $appVersion = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $npmVersion = (Get-Content package.json | ConvertFrom-Json).version
+          $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"(.+)"' |
+            Select-Object -First 1).Matches.Groups[1].Value
+          if ($env:GITHUB_REF_NAME -ne "v$appVersion") {
+            throw "Release tag $env:GITHUB_REF_NAME does not match application version v$appVersion."
+          }
+          if ($npmVersion -ne $appVersion -or $cargoVersion -ne $appVersion) {
+            throw "Version drift: tauri.conf.json=$appVersion package.json=$npmVersion Cargo.toml=$cargoVersion."
+          }
+
+      - name: Verify and create Windows installers
+        run: just ci-windows
+
+      - name: Install packaged application and smoke test it
+        run: just smoke-install-windows
+
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: QueenUI-windows-x64-installers
+          path: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified Windows installers
+        uses: actions/download-artifact@v5
+        with:
+          name: QueenUI-windows-x64-installers
+          path: release-assets
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $assets = Get-ChildItem release-assets -Recurse -File | Select-Object -ExpandProperty FullName
+          if (-not $assets) {
+            throw "No release assets were downloaded."
+          }
+
+          gh release view $env:GITHUB_REF_NAME *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:GITHUB_REF_NAME $assets --clobber
+          }
+          else {
+            gh release create $env:GITHUB_REF_NAME $assets `
+              --generate-notes `
+              --title "QueenUI $env:GITHUB_REF_NAME"
+          }

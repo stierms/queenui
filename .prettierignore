@@ -1,0 +1,13 @@
+artifacts/
+dist/
+node_modules/
+src-tauri/gen/
+src-tauri/target/
+crates/*/target/
+crates/*/Cargo.lock
+test-results/
+playwright-report/
+package-lock.json
+src-tauri/Cargo.lock
+src/types/models.gen.ts
+*.tsbuildinfo
