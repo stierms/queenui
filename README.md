@@ -6,6 +6,12 @@ opponents, plays the games, and shows you every board while it happens.
 
 ![Four live games in the grid view](docs/screenshots/game-grid.png)
 
+## Download
+
+Installers for Windows (`.exe`/`.msi`) and Linux (AppImage/`.deb`) are on the
+[releases page](https://github.com/stierms/queenui/releases), along with the
+headless runner for Linux. Or build from source — see Development below.
+
 ## What it does
 
 - Runs several bot accounts at once. Accounts are isolated from each other,
