@@ -2434,6 +2434,7 @@ mod tests {
         release: CancellationToken,
     }
 
+    #[cfg(not(windows))]
     #[derive(Clone)]
     struct PairingCapabilityState {
         bearer: Arc<Mutex<String>>,
@@ -2446,6 +2447,7 @@ mod tests {
         last_command: Arc<Mutex<Option<serde_json::Value>>>,
     }
 
+    #[cfg(not(windows))]
     #[derive(Clone)]
     struct SnapshotScript {
         calls: Arc<AtomicUsize>,
@@ -2453,6 +2455,7 @@ mod tests {
         inventory: HandoverInventory,
     }
 
+    #[cfg(not(windows))]
     async fn authenticated_capabilities(
         State(state): State<PairingCapabilityState>,
         headers: HeaderMap,
@@ -2476,6 +2479,7 @@ mod tests {
         .into_response()
     }
 
+    #[cfg(not(windows))]
     async fn authenticated_command(
         State(state): State<PairingCapabilityState>,
         headers: HeaderMap,
@@ -2532,6 +2536,7 @@ mod tests {
         StatusCode::BAD_REQUEST
     }
 
+    #[cfg(not(windows))]
     async fn scripted_snapshot(State(script): State<SnapshotScript>) -> Json<SnapshotResponse> {
         Json(SnapshotResponse {
             protocol_version: PROTOCOL_VERSION,
@@ -2540,6 +2545,7 @@ mod tests {
         })
     }
 
+    #[cfg(not(windows))]
     async fn scripted_inventory(
         State(script): State<SnapshotScript>,
         Json(request): Json<CommandRequest>,
@@ -2552,6 +2558,7 @@ mod tests {
         Json(CommandResponse::success(request.request_id, result))
     }
 
+    #[cfg(not(windows))]
     async fn snapshot_runner(
         snapshot: models::AppSnapshot,
     ) -> (String, SnapshotScript, tokio::task::JoinHandle<()>) {
@@ -2570,6 +2577,7 @@ mod tests {
         .await
     }
 
+    #[cfg(not(windows))]
     async fn handover_runner(
         snapshot: models::AppSnapshot,
         inventory: HandoverInventory,
@@ -2589,6 +2597,7 @@ mod tests {
         (endpoint, script, server)
     }
 
+    #[cfg(not(windows))]
     fn live_game(id: &str) -> models::LiveGame {
         models::LiveGame {
             id: id.into(),
