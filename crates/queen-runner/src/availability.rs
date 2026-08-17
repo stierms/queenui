@@ -27,6 +27,8 @@ enum NormalOperation {
     StartBot,
     StartCampaign(CampaignSettings),
     #[cfg(test)]
+    // Constructed only by the unix-gated acceptance tests; dead on Windows.
+    #[cfg_attr(windows, allow(dead_code))]
     WaitUntilPriorityStop(oneshot::Sender<()>),
 }
 

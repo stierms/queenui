@@ -1193,10 +1193,12 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(windows))]
+    use super::acquire_command_admission;
     use super::{
-        acquire_command_admission, await_reservation_for, canonical_public_url, execute,
-        pending_response, redact_for_log, release_failed_admission, router,
-        validate_runner_command, ServerState, RUNNER_SHUTDOWN_BUDGET,
+        await_reservation_for, canonical_public_url, execute, pending_response, redact_for_log,
+        release_failed_admission, router, validate_runner_command, ServerState,
+        RUNNER_SHUTDOWN_BUDGET,
     };
     use crate::engine_admin::EngineAdmin;
     use crate::persistence::{IdempotencyBinding, Reservation, RunnerDatabase};
@@ -1211,13 +1213,15 @@ mod tests {
         AppState,
     };
     use queen_protocol::{PendingResponse, RunnerCommand, PROTOCOL_VERSION};
+    #[cfg(not(windows))]
+    use std::time::Instant;
     use std::{
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
         },
         task::Poll,
-        time::{Duration, Instant},
+        time::Duration,
     };
     use tower::ServiceExt;
     use uuid::Uuid;

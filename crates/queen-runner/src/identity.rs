@@ -152,7 +152,7 @@ fn protect_private_key(bytes: &[u8]) -> Result<Vec<u8>, String> {
         Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB},
     };
 
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: u32::try_from(bytes.len())
             .map_err(|_| "The runner private key is too large for DPAPI".to_string())?,
         pbData: bytes.as_ptr().cast_mut(),
@@ -160,7 +160,7 @@ fn protect_private_key(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut output = CRYPT_INTEGER_BLOB::default();
     let success = unsafe {
         CryptProtectData(
-            &mut input,
+            &input,
             ptr::null(),
             ptr::null(),
             ptr::null(),
@@ -199,7 +199,7 @@ fn unprotect_private_key(bytes: &[u8]) -> Result<Vec<u8>, String> {
         },
     };
 
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: u32::try_from(bytes.len())
             .map_err(|_| "The protected runner private key is too large".to_string())?,
         pbData: bytes.as_ptr().cast_mut(),
@@ -207,7 +207,7 @@ fn unprotect_private_key(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut output = CRYPT_INTEGER_BLOB::default();
     let success = unsafe {
         CryptUnprotectData(
-            &mut input,
+            &input,
             ptr::null_mut(),
             ptr::null(),
             ptr::null(),
