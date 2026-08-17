@@ -1,0 +1,39 @@
+# Logs
+# Anchored: a bare `logs` matches a directory at ANY depth, which silently
+# excluded src/components/logs/ from the repository.
+/logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+/dist
+/dist-ssr
+/artifacts
+/playwright-report
+/test-results
+*.local
+*.tsbuildinfo
+.env*
+/HANDOVER.md
+/.claude/
+
+# Standalone Rust crate build outputs and library lockfiles
+/crates/*/target/
+/crates/queen-client/Cargo.lock
+/crates/queen-core/Cargo.lock
+/crates/queen-protocol/Cargo.lock
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
