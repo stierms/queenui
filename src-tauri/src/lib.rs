@@ -2357,30 +2357,38 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_lichess_account_inner, decode_runner_identity, desktop_config_path,
-        dismiss_game_error_inner, embedded_connection_event, encode_runner_identity,
-        forget_runner_credential_inner, get_runner_identity, get_snapshot_inner,
-        legacy_runner_url_hint, load_desktop_config, operator_safe_snapshot_error, pair_and_store,
-        redact_remote_snapshot, run_remote_event_loop, runner_client_for_endpoint,
-        save_desktop_config, set_runner_settings_inner, settings_view, store_runner_identity,
-        update_lichess_account_token_inner, validate_ssh_alias, verify_remote_handover,
-        ActiveBackend, ActiveRunner, BackendEvents, BackendNotificationEvent, BackendSnapshotEvent,
-        BackendState, CloseRequestedPayload, DesktopRunnerConfig, EmbeddedBackend, PreviousBackend,
-        RemoteBackend, RunnerConnectionEvent, RunnerConnectionState, RunnerConnectionTest,
-        RunnerSettingsState, RunnerSettingsView, INTERRUPTED_SWITCH_ERROR, LEGACY_RUNNER_TOKEN_KEY,
-        REMOTE_EVENT_HEARTBEAT, RUNNER_CONNECTION_EVENT, RUNNER_IDENTITY_KEY,
+        add_lichess_account_inner, decode_runner_identity, dismiss_game_error_inner,
+        embedded_connection_event, encode_runner_identity, get_runner_identity, get_snapshot_inner,
+        operator_safe_snapshot_error, redact_remote_snapshot, run_remote_event_loop,
+        runner_client_for_endpoint, settings_view, update_lichess_account_token_inner,
+        validate_ssh_alias, ActiveBackend, ActiveRunner, BackendEvents, BackendNotificationEvent,
+        BackendSnapshotEvent, BackendState, CloseRequestedPayload, DesktopRunnerConfig,
+        EmbeddedBackend, PreviousBackend, RemoteBackend, RunnerConnectionEvent,
+        RunnerConnectionState, RunnerConnectionTest, RunnerSettingsState, RunnerSettingsView,
+        INTERRUPTED_SWITCH_ERROR, REMOTE_EVENT_HEARTBEAT, RUNNER_CONNECTION_EVENT,
     };
+    #[cfg(not(windows))]
+    use super::{
+        desktop_config_path, forget_runner_credential_inner, legacy_runner_url_hint,
+        load_desktop_config, pair_and_store, save_desktop_config, set_runner_settings_inner,
+        store_runner_identity, verify_remote_handover, LEGACY_RUNNER_TOKEN_KEY,
+        RUNNER_IDENTITY_KEY,
+    };
+    #[cfg(not(windows))]
+    use axum::http::HeaderMap;
     use axum::{
         extract::{ws::Message, ws::WebSocketUpgrade, State},
-        http::{HeaderMap, StatusCode},
+        http::StatusCode,
         response::{IntoResponse, Response},
         routing::{get, post},
         Json, Router,
     };
     use queen_core::{diagnostics, enginelog, history, models, AppState, CoreEvent};
+    #[cfg(not(windows))]
+    use queen_protocol::RunnerCapabilities;
     use queen_protocol::{
-        CommandRequest, CommandResponse, EventEnvelope, HandoverInventory, RunnerCapabilities,
-        RunnerCommand, RunnerIdentity, SnapshotResponse, PAIRING_PAYLOAD_VERSION, PROTOCOL_VERSION,
+        CommandRequest, CommandResponse, EventEnvelope, HandoverInventory, RunnerCommand,
+        RunnerIdentity, SnapshotResponse, PAIRING_PAYLOAD_VERSION, PROTOCOL_VERSION,
     };
     use std::{
         fs,
