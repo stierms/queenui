@@ -774,13 +774,20 @@ mod tests {
         const AFTER: &str = "global-test marker: after install";
         const SECOND: &str = "global-test marker: after the second install";
 
+        // Another test in this binary may have installed the global sink
+        // first; the early-drop property is only observable when this test
+        // wins that race, so it is asserted conditionally.
+        let sink_already_installed = super::global().is_some();
+
         // Dropped rather than panicking.
         super::record(DiagnosticEntry::error("storage", EARLY));
 
         let directory = temp_dir();
         let installed = super::install(DiagnosticsLog::load(&directory));
         assert!(std::ptr::eq(installed, super::global().expect("global")));
-        assert!(!messages(&installed.recent(&all())).contains(&EARLY));
+        if !sink_already_installed {
+            assert!(!messages(&installed.recent(&all())).contains(&EARLY));
+        }
 
         super::record(DiagnosticEntry::warn("lichess", AFTER));
         assert!(messages(&installed.recent(&all())).contains(&AFTER));
