@@ -1,72 +1,69 @@
 # QueenUI
 
-**A desktop workspace for running Lichess bots.** You bring UCI engines and
-Lichess `BOT` accounts; QueenUI runs the fleet — matchmaking, live boards,
-engine lifecycles, and an optional headless runner so the games don't live
-on your desktop.
+QueenUI is a desktop app for running chess bots on Lichess. You add your UCI
+engines and your Lichess `BOT` accounts, and QueenUI does the rest: it finds
+opponents, plays the games, and shows you every board while it happens.
 
 ![Four live games in the grid view](docs/screenshots/game-grid.png)
 
-## What QueenUI is
+## What it does
 
-- **A bot fleet operator.** Multiple Lichess `BOT` accounts, each isolated:
-  one bot, engine, or network failure never interrupts another.
-- **A matchmaking campaign runner.** Rating range, clocks, rated/casual,
-  concurrency — it finds opponents and keeps games flowing, and stopping it
-  lets running games finish.
-- **A live cockpit.** Every board in a grid at a glance, or one game in
-  focus with engine telemetry; frozen and failed games say so instead of
-  pretending.
-- **A remote runner.** A small service on another machine drives the
-  engines and plays on even when the desktop is closed. Switching between
-  local and remote is live — no restart.
-- **Built to survive.** Crashes reconcile against Lichess before automation
-  resumes, and interrupted games are picked back up.
+- Runs several bot accounts at once. Accounts are isolated from each other,
+  so a crashing engine or a dropped connection on one bot doesn't touch the
+  others.
+- Matchmaking: pick a rating range, clocks, rated or casual, and how many
+  games to play in parallel. Stopping matchmaking lets running games finish.
+- Shows all games in a grid, or one game up close with the engine's output.
+  Frozen or failed games are labelled as exactly that.
+- Can run the engines on a different machine. A small runner service keeps
+  playing even when the desktop app is closed, and you can switch between
+  local and remote without restarting anything.
+- Survives crashes. After a restart it first checks with Lichess what is
+  actually going on, then picks interrupted games back up.
 
-## What QueenUI is not
+## What it doesn't do
 
-Everything else — deliberately. If you want any of the following, better
-tools already exist and QueenUI does not try to compete with them:
+Pretty much everything else, on purpose:
 
-- **Not a general chess GUI.** No local engine-vs-engine matches, no
-  tournament runner, no gauntlets — that's [Cutechess](https://github.com/cutechess/cutechess)
-  or [fastchess](https://github.com/Disservin/fastchess).
-- **Not an analysis workbench.** No opening prep, no database, no infinite
-  analysis board — that's [En Croissant](https://encroissant.org/),
+- No local engine-vs-engine games, tournaments, or gauntlets. Use
+  [Cutechess](https://github.com/cutechess/cutechess) or
+  [fastchess](https://github.com/Disservin/fastchess) for that.
+- No analysis board, opening prep, or game database. Use
+  [En Croissant](https://encroissant.org/),
   [Nibbler](https://github.com/rooklift/nibbler), or Lichess itself.
-- **Not for playing chess yourself.** It operates bots. It only accepts
-  accounts with the `BOT` title and will never move a piece for a human.
-- **Lichess only, Standard chess only.**
+- No playing chess yourself. QueenUI only accepts accounts with the `BOT`
+  title and will never move a piece for a human account.
+- Lichess only, standard chess only.
 
 ## Getting started
 
-1. **Engines** → **Add engine** → pick a UCI executable.
-2. **Connect bot** → paste a Lichess `BOT` token. The app tells you right
-   there whether the token can play and matchmake.
-3. Start the account, start matchmaking, watch the grid.
+1. Open **Engines** and add a UCI engine executable.
+2. Connect a Lichess `BOT` account with an API token. The app tells you
+   right away whether the token can play and use matchmaking.
+3. Start the account, start matchmaking, watch.
 
 ![One game in focus with engine telemetry](docs/screenshots/game-focus.png)
 
-To run engines on another machine, see [headless runners](docs/runner.md) —
-pairing is a one-time code, and the security model is documented there.
+To run the engines on another machine instead, see
+[docs/runner.md](docs/runner.md) — pairing is a one-time code.
 
 ## Development
 
-Install [`just`](https://just.systems/) and run `just` to list the canonical
-project commands (the same recipes CI uses):
+Install [`just`](https://just.systems/) and run `just` to see the project
+commands (CI uses the same recipes):
 
 ```sh
 just install   # dependencies
 just dev       # run the app
-just check     # full verification
+just check     # lint, tests, build
 ```
 
 ## Documentation
 
-- [Reference](docs/REFERENCE.md) — feature inventory, campaign behavior, packaging, architecture
+- [Reference](docs/REFERENCE.md) — features, campaign behavior, packaging, architecture
 - [Headless runners](docs/runner.md) and the [runner protocol](docs/runner-protocol.md)
 - [Persistence](docs/persistence.md) and [logs](docs/logs.md)
 - [Frontend architecture](docs/frontend-architecture.md)
 
-Licensed [GPL-3.0-or-later](LICENSE). Third-party notices:
+License: [GPL-3.0-or-later](LICENSE). Third-party notices are in
 [docs/THIRD-PARTY-NOTICES.md](docs/THIRD-PARTY-NOTICES.md).
