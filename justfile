@@ -115,6 +115,10 @@ wsl-windows-bootstrap:
 wsl-windows-build:
     powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w scripts/wsl-windows-build.ps1)" -SourcePath "$(wslpath -w .)"
 
+# Run clippy on the Windows host toolchain from WSL2 (catches windows-only lint).
+wsl-windows-clippy:
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w scripts/wsl-windows-build.ps1)" -SourcePath "$(wslpath -w .)" -ClippyOnly
+
 # Build on Windows from WSL2 and open the native Windows installer.
 [linux]
 wsl-windows-install:

@@ -1,5 +1,6 @@
 [CmdletBinding()]
 param(
+    [switch]$ClippyOnly,
     [Parameter(Mandatory = $true)]
     [string]$SourcePath,
     [switch]$BootstrapOnly,
@@ -203,6 +204,15 @@ Set-Location $stagePath
 
 Write-Host "Installing dependencies with native Windows npm..." -ForegroundColor Cyan
 Invoke-NativeCommand -Command "npm.cmd" -CommandArguments @("ci")
+
+if ($ClippyOnly) {
+    Write-Host "Running clippy with the native Windows toolchain..." -ForegroundColor Cyan
+    foreach ($manifest in @("src-tauri\Cargo.toml", "crates\queen-runner\Cargo.toml", "crates\queen-client\Cargo.toml", "crates\queen-core\Cargo.toml", "crates\queen-protocol\Cargo.toml")) {
+        Invoke-NativeCommand -Command "cargo.exe" -CommandArguments @("clippy", "--manifest-path", $manifest, "--all-targets", "--", "-D", "warnings")
+    }
+    Write-Host "Windows clippy passed." -ForegroundColor Green
+    exit 0
+}
 
 if ($ResponsiveOnly) {
     Write-Host "Running responsive layout tests in Microsoft Edge..." -ForegroundColor Cyan

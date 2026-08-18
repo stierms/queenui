@@ -2406,8 +2406,12 @@ pub async fn refresh_engine_options(
 
 #[cfg(test)]
 mod engine_probe_truth_tests {
-    use super::{add_engine, refresh_engine_options, AppState, CoreStateRef};
-    use crate::{models::AppConfig, storage, test_support};
+    #[cfg(not(windows))]
+    use super::add_engine;
+    use super::{refresh_engine_options, AppState, CoreStateRef};
+    #[cfg(not(windows))]
+    use crate::models::AppConfig;
+    use crate::{storage, test_support};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unix_time_ms() -> u64 {
@@ -5672,11 +5676,12 @@ mod submission_safety_tests {
 #[cfg(test)]
 mod owned_lifecycle_acceptance_tests {
     use super::{
-        add_lichess_account, create_challenge, handle_account_event, process_game_event,
-        remove_lichess_account, spawn_game_wrapper, spawn_supervisor_wrapper,
-        update_lichess_account_token, AppState, CoreStateRef, GameContext, GameTask, MoveTransport,
-        SubmissionCoordinator, SupervisorTask, TASK_JOIN_TIMEOUT,
+        add_lichess_account, create_challenge, handle_account_event, remove_lichess_account,
+        spawn_game_wrapper, spawn_supervisor_wrapper, update_lichess_account_token, AppState,
+        CoreStateRef, GameTask, SupervisorTask, TASK_JOIN_TIMEOUT,
     };
+    #[cfg(not(windows))]
+    use super::{process_game_event, GameContext, MoveTransport, SubmissionCoordinator};
     use crate::models::{AddAccountRequest, CampaignSettings, ChallengeRequest};
     use crate::storage::{self, FileSecretStore, SecretStore};
     use crate::test_support::{
@@ -7721,8 +7726,10 @@ done
         let _ = std::fs::remove_dir_all(failed_root);
     }
 
+    #[cfg(not(windows))]
     struct CountingMoveTransport(std::sync::atomic::AtomicUsize);
 
+    #[cfg(not(windows))]
     impl MoveTransport for CountingMoveTransport {
         fn submit<'a>(
             &'a self,
