@@ -10,7 +10,22 @@ import { pieceSets, storedPieceSet } from "./lib/appearance";
 
 const kinds: PieceKind[] = ["p", "n", "b", "r", "q", "k"];
 const colors: PieceColor[] = ["w", "b"];
-const setIds: PieceSetId[] = ["regal", "staunton", "ink", "blueprint", "deco"];
+const setIds: PieceSetId[] = [
+  "regal",
+  "staunton",
+  "ink",
+  "blueprint",
+  "deco",
+  "relay",
+  "chisel",
+  "matrix",
+  "optic",
+  "switchgear",
+  "kiln",
+  "compositor",
+  "aperture",
+];
+const previewSetIds: PieceSetId[] = ["horn", "nib", "lamp", "foundry"];
 
 afterEach(() => {
   cleanup();
@@ -18,7 +33,7 @@ afterEach(() => {
 });
 
 describe("piece set catalog", () => {
-  it("offers all five sets with regal first", () => {
+  it("offers the five original and eight approved sets with regal first", () => {
     expect(pieceSets.map((set) => set.id)).toEqual(setIds);
   });
 
@@ -29,10 +44,14 @@ describe("piece set catalog", () => {
     expect(storedPieceSet()).toBe("regal");
     localStorage.setItem("queenui-piece-set", "staunton");
     expect(storedPieceSet()).toBe("staunton");
+    localStorage.setItem("queenui-piece-set", "aperture");
+    expect(storedPieceSet()).toBe("aperture");
+    localStorage.setItem("queenui-piece-set", "horn");
+    expect(storedPieceSet()).toBe("regal");
   });
 });
 
-describe.each(setIds)("ChessPiece set %s", (setId) => {
+describe.each([...setIds, ...previewSetIds])("ChessPiece set %s", (setId) => {
   it.each(kinds)("renders both colors of piece type %s", (kind) => {
     for (const color of colors) {
       const { container, unmount } = render(

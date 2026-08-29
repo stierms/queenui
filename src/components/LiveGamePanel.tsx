@@ -82,7 +82,7 @@ export const LiveGamePanel = memo(function LiveGamePanel({
     collapsed?.analysis === true && collapsed.moves === true;
   return (
     <article
-      className={`panel live-panel ${frozen ? "panel-frozen" : ""}`}
+      className={`panel live-panel board-identity-${boardTheme} ${frozen ? "panel-frozen" : ""}`}
       style={boardAppearanceStyle(boardTheme)}
     >
       <div className="panel-heading live-game-heading">

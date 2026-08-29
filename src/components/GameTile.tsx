@@ -181,7 +181,7 @@ export const GameTile = memo(function GameTile({
   });
   return (
     <article
-      className={`panel game-tile ${frozen ? "panel-frozen" : ""}`}
+      className={`panel game-tile board-identity-${boardTheme} ${frozen ? "panel-frozen" : ""}`}
       style={boardAppearanceStyle(boardTheme)}
     >
       <div className="tile-top">

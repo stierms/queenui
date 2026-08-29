@@ -303,21 +303,21 @@ describe("QueenUI challenge workflow", () => {
       await screen.findByRole("heading", { name: "Board and pieces" }),
     ).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Walnut" }));
-    await user.click(screen.getByRole("button", { name: /Ink/ }));
+    await user.click(screen.getByRole("button", { name: "Kiln" }));
+    await user.click(screen.getByRole("button", { name: /Shard/ }));
     await user.click(
       screen.getByRole("switch", { name: "Move and capture sounds" }),
     );
 
     await waitFor(() => {
-      expect(localStorage.getItem("queenui-board-theme")).toBe("walnut");
-      expect(localStorage.getItem("queenui-piece-set")).toBe("ink");
+      expect(localStorage.getItem("queenui-board-theme")).toBe("kiln");
+      expect(localStorage.getItem("queenui-piece-set")).toBe("kiln");
       expect(localStorage.getItem("queenui-move-sounds")).toBe("off");
     });
     // The swatch is now `aria-hidden` (an `aria-label` on a bare div is
     // dropped anyway); the selection is asserted on the visible text that
     // states it, which is what an operator actually reads.
-    expect(screen.getByText("Walnut · Ink")).toBeInTheDocument();
+    expect(screen.getByText("Kiln · Shard")).toBeInTheDocument();
     expect(
       screen.getByRole("switch", { name: "Move and capture sounds" }),
     ).not.toBeChecked();
@@ -494,22 +494,25 @@ describe("QueenUI challenge workflow", () => {
     expect(document.querySelector(".pv-line code")).toHaveTextContent("e5 Nf3");
 
     await user.click(screen.getByLabelText("Board appearance"));
-    await user.click(screen.getByRole("button", { name: "Walnut" }));
-    await user.click(screen.getByRole("button", { name: /Blueprint/ }));
-    expect(screen.getByRole("button", { name: /^Walnut/ })).toHaveAttribute(
+    await user.click(screen.getByRole("button", { name: "Switchgear" }));
+    await user.click(screen.getByRole("button", { name: /Contact/ }));
+    expect(screen.getByRole("button", { name: /^Switchgear/ })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
-    expect(screen.getByRole("button", { name: /Blueprint/ })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: /Contact/ })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
     expect(board.closest(".live-panel")).toHaveStyle({
-      "--board-light": "#dcc4a4",
-      "--board-dark": "#7a563f",
+      "--board-light": "#aaa39a",
+      "--board-dark": "#3b332f",
     });
-    expect(localStorage.getItem("queenui-board-theme")).toBe("walnut");
-    expect(localStorage.getItem("queenui-piece-set")).toBe("blueprint");
+    expect(board.closest(".live-panel")).toHaveClass(
+      "board-identity-switchgear",
+    );
+    expect(localStorage.getItem("queenui-board-theme")).toBe("switchgear");
+    expect(localStorage.getItem("queenui-piece-set")).toBe("switchgear");
   });
 
   it("filters finished games, shows ratings and result, and exports valid PGN", async () => {

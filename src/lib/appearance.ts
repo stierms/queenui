@@ -1,5 +1,6 @@
 import type { CSSProperties } from "react";
 import type { PieceSetId } from "../ChessPiece";
+import { INTEGRATED_APPEARANCE_IDENTITIES } from "./appearanceIdentities";
 
 export const boardThemes = [
   {
@@ -50,21 +51,38 @@ export const boardThemes = [
     accent: "#c6ff62",
     highlight: "#8fae3a",
   },
+  ...INTEGRATED_APPEARANCE_IDENTITIES.map(
+    ({ id, name, light, dark, accent, highlight }) => ({
+      id,
+      name,
+      light,
+      dark,
+      accent,
+      highlight,
+    }),
+  ),
 ] as const;
 
 export type BoardThemeId = (typeof boardThemes)[number]["id"];
 
-export const pieceSets: {
-  id: PieceSetId;
-  name: string;
-  description: string;
-}[] = [
+export const pieceSets = [
   { id: "regal", name: "Regal", description: "Sculpted tournament" },
   { id: "staunton", name: "Staunton", description: "Classic club profile" },
   { id: "ink", name: "Ink", description: "Printed figurine" },
   { id: "blueprint", name: "Blueprint", description: "Schematic linework" },
   { id: "deco", name: "Deco", description: "Brass-age geometry" },
-];
+  ...INTEGRATED_APPEARANCE_IDENTITIES.map(
+    ({ pieceSet, pieceName, pieceDescription }) => ({
+      id: pieceSet,
+      name: pieceName,
+      description: pieceDescription,
+    }),
+  ),
+] as const satisfies readonly {
+  id: PieceSetId;
+  name: string;
+  description: string;
+}[];
 
 export function storedBoardTheme(): BoardThemeId {
   const stored = localStorage.getItem("queenui-board-theme");
@@ -88,5 +106,6 @@ export function boardAppearanceStyle(themeId: BoardThemeId) {
     "--board-dark": theme.dark,
     "--board-accent": theme.accent,
     "--board-highlight": theme.highlight,
+    "--board-check": "#dd7a6f",
   } as CSSProperties;
 }
