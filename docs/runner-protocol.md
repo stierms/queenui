@@ -92,7 +92,9 @@ lifecycle changes are owned by per-account actors. Stop/cancel uses the
 actor's priority channel and never acquires normal admission; it signals
 cancellation before bounded joins. Query inputs, rows, response bytes,
 concurrency and wall time are capped. Log export is decoded through a byte cap.
-Engine concurrency, memory address space, configured CPU threads, descendant
+Engine concurrency, Hash/RSS memory, virtual address space (Hash budget plus a
+fixed tablebase mapping headroom — `RLIMIT_AS` is VAS, not RAM), configured CPU
+threads, descendant
 task count, per-engine and aggregate output rate, per-engine output bytes,
 stored log bytes, and content-store temporary/installed bytes have server-owned
 ceilings plus a disk free-space reserve. Output controls are sanitized and an

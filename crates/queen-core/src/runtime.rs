@@ -4294,6 +4294,12 @@ async fn process_game_event(
             if let Some(log) = &context.log {
                 log.note(&format!("engine-restart reason={first_error}"));
             }
+            diagnostics::record(
+                DiagnosticEntry::warn("engine", "Restarting the engine after a failed search")
+                    .with_account(&account.id)
+                    .with_game(game_id)
+                    .with_detail(&first_error),
+            );
             let governor = app.engine_governor();
             search_result = match uci::UciEngine::start_governed(
                 &engine_profile.path,
@@ -4354,6 +4360,12 @@ async fn process_game_event(
                 if let Some(log) = &context.log {
                     log.note(&format!("search-failed detail={error}"));
                 }
+                diagnostics::record(
+                    DiagnosticEntry::error("engine", "Engine recovery failed")
+                        .with_account(&account.id)
+                        .with_game(game_id)
+                        .with_detail(&error),
+                );
                 submissions.shutdown().await?;
                 let reconciliation =
                     lichess::ongoing_game_ids(&app.0.api_base, &app.0.api_client, token).await;

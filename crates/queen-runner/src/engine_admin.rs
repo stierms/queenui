@@ -54,6 +54,9 @@ pub(crate) struct AvailabilityLimits {
     pub query_concurrency: usize,
     pub blocking_workers: usize,
     pub simultaneous_engines: usize,
+    /// Aggregate Hash/RSS budget across simultaneous engines. Not the process
+    /// address-space ceiling: file-backed Syzygy maps get a separate VAS headroom
+    /// in queen-core so a 6-piece `.rtbw` cannot `ENOMEM` under this number.
     pub total_engine_memory_mb: u64,
     pub total_engine_cpu_threads: usize,
     pub total_engine_tasks: usize,

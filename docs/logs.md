@@ -75,7 +75,7 @@ A live session still has no index record until it closes. After a crash, orphan 
 
 QueenUI reported operational problems with `eprintln!`, which in a bundled Windows build has no console to reach — the messages were written nowhere. They now go to a bounded in-memory ring (1000 entries, what the Logs tab renders) and to `logs/diagnostics.jsonl`, so they survive a restart.
 
-Each entry carries a level (`info` < `warn` < `error`; the filter is a minimum, not an equality), a source (`engine`, `lichess`, `campaign`, `storage`, `app`), the account and game it concerns when it concerns one, a one-line operator-facing message, and the underlying error as detail.
+Each entry carries a level (`info` < `warn` < `error`; the filter is a minimum, not an equality), a source (`engine`, `lichess`, `campaign`, `storage`, `app`), the account and game it concerns when it concerns one, a one-line operator-facing message, and the underlying error as detail. Engine-search restarts and failed recovery (the path that can auto-resign) are recorded here as well as in the session transcript, so the reason is visible without opening a `.uci.gz`.
 
 Diagnostics keep their own 90-day horizon rather than following the engine-log age cap. They are a few entries an hour, not a transcript archive, and coupling them would mean shortening how long transcripts are kept silently discarded months of operational history.
 

@@ -25,6 +25,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const STOP_GRACE: Duration = Duration::from_millis(1500);
 const ENGINE_STDOUT_LINE_CAP: usize = 1024 * 1024;
 const ENGINE_STDERR_LINE_CAP: usize = 64 * 1024;
+/// Extra virtual address space for file-backed maps (Syzygy WDL/DTZ).
+///
+/// `total_memory_mb` is the Hash/RSS budget. Linux `RLIMIT_AS` and Windows Job
+/// `ProcessMemoryLimit` count address space: a 6-piece `.rtbw` is 0.3–2.0 GiB
+/// of VAS even when almost none of it is resident. Using the Hash slice as
+/// `RLIMIT_AS` made `mmap` return ENOMEM while the machine still had free RAM.
+const TABLEBASE_ADDRESS_SPACE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "PATHEXT",
@@ -50,6 +57,8 @@ pub(crate) fn unix_time_ms() -> u64 {
 #[derive(Clone, Debug)]
 pub struct EngineLimits {
     pub simultaneous_engines: usize,
+    /// Aggregate Hash/RSS budget. Process address space is this slice plus
+    /// [`TABLEBASE_ADDRESS_SPACE_BYTES`].
     pub total_memory_mb: u64,
     pub total_cpu_threads: usize,
     pub total_tasks: usize,
@@ -134,8 +143,7 @@ impl EngineGovernor {
                 per_engine_total: self.limits.output_bytes_per_engine,
                 consumed: Arc::new(AtomicU64::new(0)),
             },
-            memory_bytes: self.limits.total_memory_mb.saturating_mul(1024 * 1024)
-                / self.limits.simultaneous_engines as u64,
+            address_space_bytes: per_engine_address_space_bytes(&self.limits),
             task_limit: (self.limits.total_tasks / self.limits.simultaneous_engines).max(1),
         })
     }
@@ -150,8 +158,20 @@ impl Default for EngineGovernor {
 struct EngineLease {
     _permit: OwnedSemaphorePermit,
     meter: OutputMeter,
-    memory_bytes: u64,
+    address_space_bytes: u64,
     task_limit: usize,
+}
+
+fn per_engine_hash_bytes(limits: &EngineLimits) -> u64 {
+    limits.total_memory_mb.saturating_mul(1024 * 1024) / limits.simultaneous_engines as u64
+}
+
+fn per_engine_hash_mb(limits: &EngineLimits) -> u64 {
+    (limits.total_memory_mb / limits.simultaneous_engines as u64).max(1)
+}
+
+fn per_engine_address_space_bytes(limits: &EngineLimits) -> u64 {
+    per_engine_hash_bytes(limits).saturating_add(TABLEBASE_ADDRESS_SPACE_BYTES)
 }
 
 #[derive(Clone)]
@@ -205,7 +225,7 @@ fn validate_configured_resources(
     limits: &EngineLimits,
 ) -> Result<(), String> {
     let per_engine_threads = (limits.total_cpu_threads / limits.simultaneous_engines).max(1) as u64;
-    let per_engine_hash = (limits.total_memory_mb / limits.simultaneous_engines as u64).max(1);
+    let per_engine_hash = per_engine_hash_mb(limits);
     for option in options {
         let Some(value) = option.value.as_deref() else {
             continue;
@@ -342,7 +362,7 @@ impl UciEngine {
         {
             use std::os::unix::process::CommandExt;
             command.as_std_mut().process_group(0);
-            let memory_bytes = lease.memory_bytes;
+            let address_space_bytes = lease.address_space_bytes;
             let task_limit = lease.task_limit;
             let task_ceiling = match current_user_task_count() {
                 Ok(current_tasks) => Some(nproc_ceiling(current_tasks, task_limit)),
@@ -362,8 +382,8 @@ impl UciEngine {
             unsafe {
                 command.as_std_mut().pre_exec(move || {
                     let memory = libc::rlimit {
-                        rlim_cur: memory_bytes,
-                        rlim_max: memory_bytes,
+                        rlim_cur: address_space_bytes,
+                        rlim_max: address_space_bytes,
                     };
                     if libc::setrlimit(libc::RLIMIT_AS, &memory) != 0 {
                         return Err(std::io::Error::last_os_error());
@@ -391,7 +411,8 @@ impl UciEngine {
         let mut child = command
             .spawn()
             .map_err(|error| format!("Could not launch the engine: {error}"))?;
-        let process_tree = ProcessTree::attach(&child, lease.memory_bytes, lease.task_limit)?;
+        let process_tree =
+            ProcessTree::attach(&child, lease.address_space_bytes, lease.task_limit)?;
         let stdin = child
             .stdin
             .take()
@@ -858,7 +879,11 @@ struct ProcessTree {
 
 #[cfg(unix)]
 impl ProcessTree {
-    fn attach(child: &Child, _memory_bytes: u64, _task_limit: usize) -> Result<Self, String> {
+    fn attach(
+        child: &Child,
+        _address_space_bytes: u64,
+        _task_limit: usize,
+    ) -> Result<Self, String> {
         let process_group = child
             .id()
             .ok_or_else(|| "The engine process has no process id".to_string())?
@@ -892,7 +917,7 @@ unsafe impl Send for ProcessTree {}
 
 #[cfg(windows)]
 impl ProcessTree {
-    fn attach(child: &Child, memory_bytes: u64, task_limit: usize) -> Result<Self, String> {
+    fn attach(child: &Child, address_space_bytes: u64, task_limit: usize) -> Result<Self, String> {
         use std::{mem::size_of, ptr};
         use windows_sys::Win32::{
             Foundation::{CloseHandle, HANDLE},
@@ -916,7 +941,7 @@ impl ProcessTree {
                 | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
             limits.BasicLimitInformation.ActiveProcessLimit =
                 task_limit.min(u32::MAX as usize) as u32;
-            limits.ProcessMemoryLimit = memory_bytes.min(usize::MAX as u64) as usize;
+            limits.ProcessMemoryLimit = address_space_bytes.min(usize::MAX as u64) as usize;
             if SetInformationJobObject(
                 job,
                 JobObjectExtendedLimitInformation,
@@ -956,7 +981,11 @@ struct ProcessTree;
 
 #[cfg(not(any(unix, windows)))]
 impl ProcessTree {
-    fn attach(_child: &Child, _memory_bytes: u64, _task_limit: usize) -> Result<Self, String> {
+    fn attach(
+        _child: &Child,
+        _address_space_bytes: u64,
+        _task_limit: usize,
+    ) -> Result<Self, String> {
         Ok(Self)
     }
     fn terminate(&mut self) {}
@@ -1114,9 +1143,11 @@ mod tests {
     #[cfg(unix)]
     use super::nproc_ceiling;
     use super::{
-        allowed_engine_environment, parse_uci_info, parse_uci_option, read_capped_line,
-        sanitize_engine_output, search_watchdog, validate_option_value, EngineGovernor,
-        EngineLimits, UciEngine, ENGINE_ENV_ALLOWLIST,
+        allowed_engine_environment, parse_uci_info, parse_uci_option,
+        per_engine_address_space_bytes, per_engine_hash_bytes, per_engine_hash_mb,
+        read_capped_line, sanitize_engine_output, search_watchdog, validate_option_value,
+        EngineGovernor, EngineLimits, UciEngine, ENGINE_ENV_ALLOWLIST,
+        TABLEBASE_ADDRESS_SPACE_BYTES,
     };
     use crate::position::LivePosition;
     use std::time::Duration;
@@ -1283,6 +1314,75 @@ done
             parse_uci_option("option name Hash type spin default 512 min 1 max 65536").unwrap();
         assert!(governor.acquire(&[threads]).await.is_err());
         assert!(governor.acquire(&[hash]).await.is_err());
+        let allowed =
+            parse_uci_option("option name Hash type spin default 256 min 1 max 65536").unwrap();
+        assert!(governor.acquire(&[allowed]).await.is_ok());
+    }
+
+    #[test]
+    fn address_space_ceiling_includes_tablebase_headroom_beyond_the_hash_budget() {
+        let limits = EngineLimits {
+            simultaneous_engines: 8,
+            total_memory_mb: 16 * 1024,
+            total_cpu_threads: 16,
+            total_tasks: 256,
+            output_bytes_per_engine_per_second: 1024,
+            total_output_bytes_per_second: 2048,
+            output_bytes_per_engine: 4096,
+        };
+        assert_eq!(per_engine_hash_mb(&limits), 2048);
+        assert_eq!(per_engine_hash_bytes(&limits), 2048 * 1024 * 1024);
+        assert_eq!(
+            per_engine_address_space_bytes(&limits),
+            2048 * 1024 * 1024 + TABLEBASE_ADDRESS_SPACE_BYTES
+        );
+        assert!(per_engine_address_space_bytes(&limits) > per_engine_hash_bytes(&limits));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tablebase_sized_file_maps_succeed_under_a_tight_hash_budget() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/fake-uci-mmap.rs");
+        let fixture =
+            std::env::temp_dir().join(format!("queenui-fake-uci-mmap-{}", uuid::Uuid::new_v4()));
+        let compilation = std::process::Command::new("rustc")
+            .args(["--edition=2021", "-o"])
+            .arg(&fixture)
+            .arg(&source)
+            .status()
+            .expect("compile mmap probe engine");
+        assert!(compilation.success(), "rustc {source:?} -> {fixture:?}");
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 256 MiB / 8 engines = 32 MiB Hash. The fixture maps 80 MiB.
+        let governor = EngineGovernor::new(EngineLimits {
+            simultaneous_engines: 8,
+            total_memory_mb: 256,
+            total_cpu_threads: 8,
+            total_tasks: 64,
+            output_bytes_per_engine_per_second: 1024 * 1024,
+            total_output_bytes_per_second: 4 * 1024 * 1024,
+            output_bytes_per_engine: 64 * 1024 * 1024,
+        })
+        .unwrap();
+        let mut engine = UciEngine::start_governed(
+            fixture.to_str().expect("UTF-8 fixture path"),
+            &[],
+            None,
+            &governor,
+        )
+        .await
+        .expect("start mmap probe engine");
+        let search = engine
+            .best_move("startpos", "", 10_000, 10_000, 0, 0, |_| {})
+            .await
+            .expect("search after mapping an 80 MiB file under a 32 MiB Hash budget");
+        assert_eq!(search.best_move, "e2e4");
+        engine.shutdown().await;
+        let _ = std::fs::remove_file(fixture);
     }
 
     #[test]
