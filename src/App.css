@@ -701,7 +701,10 @@ kbd {
 }
 .appearance-popover {
   width: min(350px, calc(100vw - 32px));
-  max-height: calc(100dvh - 32px);
+  max-height: min(
+    calc(100dvh - 32px),
+    var(--radix-popover-content-available-height)
+  );
   z-index: var(--z-popover);
   overflow-x: hidden;
   overflow-y: auto;

@@ -106,6 +106,20 @@ test("board appearance popover remains inside the compact viewport", async ({
   expect(bounds?.y).toBeGreaterThanOrEqual(0);
   expect((bounds?.y ?? 0) + (bounds?.height ?? 0)).toBeLessThanOrEqual(800);
 
+  const scrollState = await popover.evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+    overflowY: getComputedStyle(element).overflowY,
+  }));
+  expect(scrollState.overflowY).toBe("auto");
+  expect(scrollState.scrollHeight).toBeGreaterThan(scrollState.clientHeight);
+
+  const lastPieceStyle = popover.getByRole("button", { name: /Aperture/ });
+  await lastPieceStyle.scrollIntoViewIfNeeded();
+  await expect(lastPieceStyle).toBeInViewport();
+  await lastPieceStyle.click();
+  await expect(lastPieceStyle).toHaveAttribute("aria-pressed", "true");
+
   await page.keyboard.press("Escape");
   await expect(popover).toBeHidden();
   await expect(trigger).toBeFocused();
