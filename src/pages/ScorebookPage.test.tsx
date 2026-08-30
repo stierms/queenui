@@ -192,6 +192,7 @@ const lab: ScorebookLab = {
     engineRestarts: 2,
     submissionRetries: 5,
     streamReconnects: 1,
+    flagSafetyStops: 3,
     failureResigns: 1,
   },
   byConfig: [
@@ -484,6 +485,10 @@ describe("ScorebookPage", () => {
     expect(
       within(reliability).getByText("Submission retries").nextElementSibling,
     ).toHaveTextContent("5");
+    const safetyStops =
+      within(reliability).getByText("Flag-safety stops").nextElementSibling;
+    expect(safetyStops).toHaveTextContent("3");
+    expect(safetyStops).toHaveClass("lab-stat-brass");
     const resigns =
       within(reliability).getByText("Failure resigns").nextElementSibling;
     expect(resigns).toHaveTextContent("1");

@@ -285,6 +285,15 @@ pub struct SearchResult {
     pub best_move: String,
     pub last_info: Option<String>,
     pub telemetry: Option<EngineTelemetry>,
+    /// Present only when QueenUI had to interrupt a search near the flag.
+    pub flag_safety_stop: Option<FlagSafetyStop>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlagSafetyStop {
+    pub elapsed_ms: u64,
+    pub remaining_ms: u64,
+    pub reserve_ms: u64,
 }
 
 pub struct UciEngine {
@@ -560,15 +569,21 @@ impl UciEngine {
         let watchdog = search_watchdog(&live_position, white_time, black_time);
         let mut progress = SearchProgress::new();
         match timeout(
-            watchdog,
+            Duration::from_millis(watchdog.elapsed_ms),
             self.read_search_result(&live_position, &mut progress, &mut on_info),
         )
         .await
         {
             Ok(result) => result,
             Err(_) => {
+                if let Some(log) = &self.log {
+                    log.note(&format!(
+                        "flag-safety-stop elapsed={} remaining={} reserve={}",
+                        watchdog.elapsed_ms, watchdog.remaining_ms, watchdog.reserve_ms
+                    ));
+                }
                 self.send("stop").await?;
-                timeout(
+                let mut result = timeout(
                     STOP_GRACE,
                     self.read_search_result(&live_position, &mut progress, &mut on_info),
                 )
@@ -576,9 +591,11 @@ impl UciEngine {
                 .map_err(|_| {
                     format!(
                         "The engine ignored stop after the {} ms safety watchdog",
-                        watchdog.as_millis()
+                        watchdog.elapsed_ms
                     )
-                })?
+                })??;
+                result.flag_safety_stop = Some(watchdog);
+                Ok(result)
             }
         }
     }
@@ -621,6 +638,7 @@ impl UciEngine {
                     best_move,
                     last_info: progress.last_info.clone(),
                     telemetry: progress.telemetry.clone(),
+                    flag_safety_stop: None,
                 });
             }
         }
@@ -1074,7 +1092,7 @@ pub fn parse_uci_option(line: &str) -> Option<UciOption> {
     })
 }
 
-fn search_watchdog(position: &LivePosition, white_time: i64, black_time: i64) -> Duration {
+fn search_watchdog(position: &LivePosition, white_time: i64, black_time: i64) -> FlagSafetyStop {
     let remaining = if position.is_white_to_move() {
         white_time
     } else {
@@ -1082,9 +1100,16 @@ fn search_watchdog(position: &LivePosition, white_time: i64, black_time: i64) ->
     }
     .max(0) as u64;
     let reserve = (remaining / 10).clamp(500, 5_000);
-    let before_flag = remaining.saturating_sub(reserve).max(250);
-    let budget = (remaining / 3).clamp(750, 30_000).min(before_flag);
-    Duration::from_millis(budget)
+    // `go wtime ...` delegates ordinary time management to the engine. This
+    // is only a last-resort guard for a hung engine, close enough to the flag
+    // to preserve the engine's full usable clock while retaining a small
+    // submission margin. In particular, never impose a fixed per-move cap:
+    // that silently replaces the engine's policy in rapid/classical games.
+    FlagSafetyStop {
+        elapsed_ms: remaining.saturating_sub(reserve).max(250),
+        remaining_ms: remaining,
+        reserve_ms: reserve,
+    }
 }
 
 pub fn parse_uci_info(line: &str) -> Option<EngineTelemetry> {
@@ -1150,24 +1175,45 @@ mod tests {
         TABLEBASE_ADDRESS_SPACE_BYTES,
     };
     use crate::position::LivePosition;
+    #[cfg(unix)]
     use std::time::Duration;
     use tokio::io::BufReader;
 
     #[test]
-    fn search_watchdog_preserves_recovery_time() {
+    fn search_watchdog_preserves_engine_time_management_until_near_the_flag() {
         let white = LivePosition::parse("startpos", "e2e4 e7e5").unwrap();
         let black = LivePosition::parse("startpos", "e2e4").unwrap();
         assert_eq!(
             search_watchdog(&white, 110_000, 180_000),
-            Duration::from_secs(30)
+            super::FlagSafetyStop {
+                elapsed_ms: 105_000,
+                remaining_ms: 110_000,
+                reserve_ms: 5_000,
+            }
         );
         assert_eq!(
             search_watchdog(&black, 180_000, 9_000),
-            Duration::from_secs(3)
+            super::FlagSafetyStop {
+                elapsed_ms: 8_100,
+                remaining_ms: 9_000,
+                reserve_ms: 900,
+            }
         );
         assert_eq!(
             search_watchdog(&white, 1_000, 180_000),
-            Duration::from_millis(500)
+            super::FlagSafetyStop {
+                elapsed_ms: 500,
+                remaining_ms: 1_000,
+                reserve_ms: 500,
+            }
+        );
+        assert_eq!(
+            search_watchdog(&white, 600_000, 600_000),
+            super::FlagSafetyStop {
+                elapsed_ms: 595_000,
+                remaining_ms: 600_000,
+                reserve_ms: 5_000,
+            }
         );
     }
 
@@ -1178,7 +1224,11 @@ mod tests {
         let position = LivePosition::parse(fen, "").unwrap();
         assert_eq!(
             search_watchdog(&position, 180_000, 9_000),
-            Duration::from_secs(3)
+            super::FlagSafetyStop {
+                elapsed_ms: 8_100,
+                remaining_ms: 9_000,
+                reserve_ms: 900,
+            }
         );
     }
 

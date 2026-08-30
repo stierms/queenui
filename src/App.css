@@ -5779,7 +5779,7 @@ kbd {
   gap: 8px;
 }
 .lab-reliability-strip {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 .scorebook-kpis strong.lab-stat-claret {
   color: var(--claret);
@@ -5919,19 +5919,17 @@ kbd {
 }
 @media (max-width: 1280px) {
   .lab-kpis > div:nth-child(3),
-  .lab-reliability-strip > div:nth-child(3) {
+  .lab-reliability-strip > div:nth-child(2),
+  .lab-reliability-strip > div:nth-child(4) {
     border-right: 0;
   }
   .lab-reliability-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .lab-reliability-strip > div:nth-child(2) {
-    border-right: 0;
-  }
-  .lab-reliability-strip > div:nth-child(-n + 2) {
+  .lab-reliability-strip > div:nth-child(-n + 4) {
     border-bottom: 1px solid var(--line-1);
   }
-  .lab-reliability-strip > div:nth-child(3) {
+  .lab-reliability-strip > div:nth-child(5) {
     border-right: 1px solid var(--line-1);
   }
 }

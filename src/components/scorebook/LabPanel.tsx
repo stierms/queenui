@@ -79,6 +79,16 @@ function ReliabilityStrip({
           <span>Stream reconnects</span>
           <strong>{reliability.streamReconnects}</strong>
         </div>
+        <div title="Searches QueenUI stopped only after the engine reached the active clock's flag-safety margin">
+          <span>Flag-safety stops</span>
+          <strong
+            className={
+              reliability.flagSafetyStops > 0 ? "lab-stat-brass" : undefined
+            }
+          >
+            {reliability.flagSafetyStops}
+          </strong>
+        </div>
         <div>
           <span>Failure resigns</span>
           <strong

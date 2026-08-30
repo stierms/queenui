@@ -113,7 +113,12 @@ export type BookLab = { gamesWithBook: number, gamesWithout: number, scoreWith: 
  */
 avgExitEvalCp: number | null, };
 
-export type ReliabilityTotals = { engineRestarts: number, submissionRetries: number, streamReconnects: number, failureResigns: number, };
+export type ReliabilityTotals = { engineRestarts: number, submissionRetries: number, streamReconnects: number,
+/**
+ * Defaults across desktop/runner version skew where the older peer did
+ * not yet report this additive reliability counter.
+ */
+flagSafetyStops: number, failureResigns: number, };
 
 export type ConfigLine = { fingerprint: string, engineName: string, games: number, scorePercent: number, firstSeenMs: number, lastSeenMs: number, };
 

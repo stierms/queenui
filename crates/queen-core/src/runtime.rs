@@ -3902,6 +3902,7 @@ struct TelemetryCapture {
     /// the game task can exit.
     submission_retries: Arc<AtomicI64>,
     stream_reconnects: i64,
+    flag_safety_stops: i64,
     failure_resign: bool,
     end_clock_ms: Option<i64>,
 }
@@ -4009,6 +4010,7 @@ fn build_game_telemetry(
         engine_restarts: capture.engine_restarts,
         submission_retries: capture.submission_retries.load(Ordering::Relaxed),
         stream_reconnects: capture.stream_reconnects,
+        flag_safety_stops: capture.flag_safety_stops,
         failure_resign: capture.failure_resign,
         max_eval_cp: capture.eval_series_cp.iter().copied().max(),
         min_eval_cp: capture.eval_series_cp.iter().copied().min(),
@@ -4407,6 +4409,18 @@ async fn process_game_event(
                 return Ok(false);
             }
         };
+        if let Some(stop) = search.flag_safety_stop {
+            context.telemetry.flag_safety_stops += 1;
+            diagnostics::record(
+                DiagnosticEntry::warn("engine", "QueenUI used the flag-safety stop")
+                    .with_account(&account.id)
+                    .with_game(game_id)
+                    .with_detail(format!(
+                        "The engine had not returned after {} ms; QueenUI sent stop with {} ms on the active clock and a {} ms submission reserve",
+                        stop.elapsed_ms, stop.remaining_ms, stop.reserve_ms
+                    )),
+            );
+        }
         if let Some(log) = &context.log {
             log.note(&format!(
                 "bestmove uci={} elapsed={}",
@@ -4912,6 +4926,7 @@ mod telemetry_capture_tests {
         capture.end_clock_ms = Some(12_345);
         capture.engine_restarts = 1;
         capture.stream_reconnects = 2;
+        capture.flag_safety_stops = 3;
         capture
             .submission_retries
             .fetch_add(4, std::sync::atomic::Ordering::Relaxed);
@@ -4928,6 +4943,7 @@ mod telemetry_capture_tests {
         assert_eq!(telemetry.end_clock_ms, Some(12_345));
         assert_eq!(telemetry.engine_restarts, 1);
         assert_eq!(telemetry.stream_reconnects, 2);
+        assert_eq!(telemetry.flag_safety_stops, 3);
         assert_eq!(telemetry.submission_retries, 4);
         assert_eq!(telemetry.max_eval_cp, Some(120));
         assert_eq!(telemetry.min_eval_cp, Some(-1000));

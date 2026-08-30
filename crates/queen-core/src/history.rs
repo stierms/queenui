@@ -104,6 +104,10 @@ pub struct GameTelemetry {
     pub engine_restarts: i64,
     pub submission_retries: i64,
     pub stream_reconnects: i64,
+    /// Searches QueenUI interrupted only because the active clock had reached
+    /// its last-resort flag-safety margin.
+    #[serde(default)]
+    pub flag_safety_stops: i64,
     /// We resigned because the engine failed and could not be recovered.
     pub failure_resign: bool,
     pub max_eval_cp: Option<i32>,
@@ -539,6 +543,10 @@ pub struct ReliabilityTotals {
     pub engine_restarts: i64,
     pub submission_retries: i64,
     pub stream_reconnects: i64,
+    /// Defaults across desktop/runner version skew where the older peer did
+    /// not yet report this additive reliability counter.
+    #[serde(default)]
+    pub flag_safety_stops: i64,
     pub failure_resigns: i64,
 }
 
@@ -894,6 +902,7 @@ fn compute_lab(filtered: &[&GameRecord]) -> Option<ScorebookLab> {
             totals.engine_restarts += telemetry.engine_restarts;
             totals.submission_retries += telemetry.submission_retries;
             totals.stream_reconnects += telemetry.stream_reconnects;
+            totals.flag_safety_stops += telemetry.flag_safety_stops;
             totals.failure_resigns += i64::from(telemetry.failure_resign);
             totals
         },
@@ -1420,7 +1429,8 @@ pub fn compute_stats(
 mod tests {
     use super::{
         compute_stats, count_blunders, perf_key_for_clock, record_from_lichess_export,
-        result_from_pgn, GameRecord, GameTelemetry, HistoryStore, ScorebookFilter,
+        result_from_pgn, GameRecord, GameTelemetry, HistoryStore, ReliabilityTotals,
+        ScorebookFilter,
     };
     use crate::models::AccountProfile;
     use serde_json::json;
@@ -1736,6 +1746,7 @@ mod tests {
             engine_restarts: 1,
             submission_retries: 3,
             stream_reconnects: 2,
+            flag_safety_stops: 4,
             failure_resign: false,
             max_eval_cp: Some(150),
             min_eval_cp: Some(-80),
@@ -1752,6 +1763,7 @@ mod tests {
         assert_eq!(telemetry.min_depth, Some(18));
         assert_eq!(telemetry.book_plies, 2);
         assert_eq!(telemetry.submission_retries, 3);
+        assert_eq!(telemetry.flag_safety_stops, 4);
         assert_eq!(
             telemetry.config_fingerprint.as_deref(),
             Some("00af31c2d9e4")
@@ -1767,6 +1779,16 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("telemetry");
         let back: GameRecord = serde_json::from_value(legacy).expect("legacy deserialize");
         assert!(back.telemetry.is_none());
+
+        // Telemetry written before the flag-safety counter was introduced is
+        // still valid and means no recorded safety stops.
+        let mut legacy = serde_json::to_value(&with).expect("to value");
+        legacy["telemetry"]
+            .as_object_mut()
+            .unwrap()
+            .remove("flagSafetyStops");
+        let back: GameRecord = serde_json::from_value(legacy).expect("legacy telemetry");
+        assert_eq!(back.telemetry.unwrap().flag_safety_stops, 0);
     }
 
     #[test]
@@ -2095,6 +2117,7 @@ mod tests {
             engine_restarts: 1,
             submission_retries: 2,
             stream_reconnects: 3,
+            flag_safety_stops: 4,
             failure_resign: true,
             end_clock_ms: Some(10_000),
             blunders: 1,
@@ -2114,8 +2137,21 @@ mod tests {
         assert_eq!(lab.reliability.engine_restarts, 1);
         assert_eq!(lab.reliability.submission_retries, 3);
         assert_eq!(lab.reliability.stream_reconnects, 3);
+        assert_eq!(lab.reliability.flag_safety_stops, 4);
         assert_eq!(lab.reliability.failure_resigns, 1);
         assert!((lab.avg_end_clock_ms.expect("end clock") - 15_000.0).abs() < f64::EPSILON);
         assert!((lab.avg_blunders_per_game.expect("blunders") - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reliability_totals_accept_an_older_runner_without_flag_safety_stops() {
+        let totals: ReliabilityTotals = serde_json::from_value(serde_json::json!({
+            "engineRestarts": 1,
+            "submissionRetries": 2,
+            "streamReconnects": 3,
+            "failureResigns": 4
+        }))
+        .expect("legacy reliability totals");
+        assert_eq!(totals.flag_safety_stops, 0);
     }
 }
