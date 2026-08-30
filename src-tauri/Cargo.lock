@@ -2999,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "queen-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-util",
  "queen-core",
@@ -3018,7 +3018,7 @@ dependencies = [
 
 [[package]]
 name = "queen-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "flate2",
  "fs2",
@@ -3043,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "queen-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "queen-core",
  "serde",
@@ -3055,7 +3055,7 @@ dependencies = [
 
 [[package]]
 name = "queenui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "futures-util",
