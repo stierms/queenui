@@ -1,4 +1,9 @@
-import { countText } from "../lib/format";
+import {
+  countText,
+  durationShortSeconds,
+  shortDate,
+  timeOfDay,
+} from "../lib/format";
 import { assertNever, campaignStatus, type CampaignRuntime } from "../types";
 
 /*
@@ -48,6 +53,7 @@ export function schedulerHealthTitle(runtime?: CampaignRuntime) {
 export function schedulerHealthDetail(
   runtime?: CampaignRuntime,
   nextScanSeconds: number | null = null,
+  now = Date.now(),
 ) {
   const idle = "Start a campaign to begin discovering online opponents.";
   if (!runtime) return idle;
@@ -64,9 +70,10 @@ export function schedulerHealthDetail(
         ? "Another scan is scheduled automatically."
         : `No eligible opponent accepted yet. Scanning again in ${nextScanSeconds}s.`;
     case "backoff":
-      return nextScanSeconds === null
-        ? "QueenUI will retry automatically."
-        : `Respecting the API limit. Retrying in ${nextScanSeconds}s.`;
+      if (nextScanSeconds === null || runtime.nextScanAt === null) {
+        return "QueenUI will retry automatically.";
+      }
+      return `Respecting the API limit. Retrying ${scheduledTime(runtime.nextScanAt, now)} (in ${durationShortSeconds(nextScanSeconds)}).`;
     case "error":
       return (
         runtime.error ||
@@ -92,4 +99,24 @@ export function schedulerHealthDetail(
     default:
       return assertNever(status);
   }
+}
+
+function scheduledTime(timestamp: number, now: number) {
+  const at = new Date(timestamp);
+  const current = new Date(now);
+  const sameDay =
+    at.getFullYear() === current.getFullYear() &&
+    at.getMonth() === current.getMonth() &&
+    at.getDate() === current.getDate();
+  if (sameDay) return `today at ${timeOfDay(timestamp)}`;
+
+  const tomorrow = new Date(current);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const nextDay =
+    at.getFullYear() === tomorrow.getFullYear() &&
+    at.getMonth() === tomorrow.getMonth() &&
+    at.getDate() === tomorrow.getDate();
+  return nextDay
+    ? `tomorrow at ${timeOfDay(timestamp)}`
+    : `on ${shortDate(timestamp)} at ${timeOfDay(timestamp)}`;
 }

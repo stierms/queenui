@@ -855,6 +855,10 @@ async fn run_with_pending_lifetime(
                             }
                             Err(error) => {
                                 let rate_limited = error.is_rate_limited();
+                                let retry_after =
+                                    error.retry_after.unwrap_or(Duration::from_secs(60));
+                                let retry_at =
+                                    epoch_millis().saturating_add(retry_after.as_millis() as u64);
                                 let ambiguous = error.ambiguous_write;
                                 let actionable_scope_error =
                                     lichess::actionable_missing_scope_message(&error);
@@ -891,13 +895,13 @@ async fn run_with_pending_lifetime(
                                     } else if ambiguous {
                                         "Challenge outcome unknown; pausing to reconcile outgoing challenges".into()
                                     } else if rate_limited {
-                                        format!(
-                                            "Lichess rate limit: waiting {} seconds",
-                                            error.retry_after.unwrap_or(Duration::from_secs(60)).as_secs()
-                                        )
+                                        "Lichess rate limit: retry scheduled automatically".into()
                                     } else {
                                         format!("{} did not accept this challenge type; trying another bot", bot.username)
                                     };
+                                    if rate_limited {
+                                        runtime.next_scan_at = Some(retry_at);
+                                    }
                                 })
                                 .await;
                                 record_event(
@@ -935,8 +939,7 @@ async fn run_with_pending_lifetime(
                                     break;
                                 }
                                 if rate_limited {
-                                    next_discovery = Instant::now()
-                                        + error.retry_after.unwrap_or(Duration::from_secs(60));
+                                    next_discovery = Instant::now() + retry_after;
                                     break;
                                 }
                             }
@@ -977,7 +980,7 @@ async fn run_with_pending_lifetime(
                             CampaignStatus::Waiting
                         };
                         runtime.activity = if rate_limited {
-                            "Lichess rate limit: waiting 60 seconds".into()
+                            "Lichess rate limit: retry scheduled automatically".into()
                         } else {
                             "Online bot discovery failed; retrying".into()
                         };

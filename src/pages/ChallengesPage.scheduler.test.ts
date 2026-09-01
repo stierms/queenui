@@ -70,7 +70,12 @@ describe("scheduler health copy", () => {
     expect(schedulerHealthDetail(runtime("waiting"))).toContain(
       "automatically",
     );
-    expect(schedulerHealthDetail(runtime("backoff"), 9)).toContain("9s");
+    const now = new Date(2026, 8, 1, 10, 27, 45).getTime();
+    const limited = runtime("backoff");
+    limited.nextScanAt = now + 73_025_000;
+    const detail = schedulerHealthDetail(limited, 73_025, now);
+    expect(detail).toContain("tomorrow at 06:44:50");
+    expect(detail).toContain("in 20h 17m");
   });
 });
 

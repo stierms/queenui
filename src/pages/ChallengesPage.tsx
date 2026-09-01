@@ -10,6 +10,7 @@ import { EmptyPage } from "../components/EmptyPage";
 import { TimeControlPresets } from "../components/TimeControlPresets";
 import type { BusyKeys } from "../hooks/useActionRunner";
 import { countLiveGames } from "../lib/chess";
+import { durationShortSeconds } from "../lib/format";
 import {
   defaultSelectedTimeControl,
   timeControlValue,
@@ -416,7 +417,9 @@ export function ChallengesPage({
             </span>
             <p>
               <strong>{schedulerHealthTitle(runtime)}</strong>
-              <small>{schedulerHealthDetail(runtime, nextScanSeconds)}</small>
+              <small>
+                {schedulerHealthDetail(runtime, nextScanSeconds, now)}
+              </small>
             </p>
           </div>
           <div className="campaign-stats">
@@ -443,7 +446,9 @@ export function ChallengesPage({
             <div>
               <span>Next scan</span>
               <strong>
-                {nextScanSeconds === null ? "—" : `${nextScanSeconds}s`}
+                {nextScanSeconds === null
+                  ? "—"
+                  : durationShortSeconds(nextScanSeconds)}
               </strong>
             </div>
           </div>

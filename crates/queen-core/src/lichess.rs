@@ -14,6 +14,7 @@ const JSON_BODY_CAP: usize = 1024 * 1024;
 pub const NDJSON_LINE_CAP: usize = 256 * 1024;
 const ONLINE_BOTS_BODY_CAP: usize = 16 * 1024 * 1024;
 const GAME_EXPORT_BODY_CAP: usize = 64 * 1024 * 1024;
+const MAX_RETRY_DELAY_SECONDS: u64 = 24 * 60 * 60;
 const OAUTH_SCOPES_HEADER: &str = "x-oauth-scopes";
 pub const MATCHMAKING_SCOPES: [&str; 3] = ["bot:play", "challenge:read", "challenge:write"];
 pub const TOKEN_CREATE_URL: &str = "lichess.org/account/oauth/token/create";
@@ -33,8 +34,8 @@ pub enum LichessErrorKind {
 }
 
 /// A bounded, typed Lichess failure. Decisions are made from status/code and
-/// Retry-After; the body is retained only as a short diagnostic and is never
-/// searched to infer general HTTP classes.
+/// explicit retry metadata; the body is retained only as a short diagnostic
+/// and is never searched to infer general HTTP classes.
 #[derive(Clone, Debug)]
 pub struct LichessError {
     pub kind: LichessErrorKind,
@@ -216,14 +217,33 @@ fn request(client: &Client, method: Method, url: Url, token: &str) -> reqwest::R
 fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Duration> {
     let raw = value?.to_str().ok()?.trim();
     if let Ok(seconds) = raw.parse::<u64>() {
-        return Some(Duration::from_secs(seconds.min(24 * 60 * 60)));
+        return Some(Duration::from_secs(seconds.min(MAX_RETRY_DELAY_SECONDS)));
     }
     let at = httpdate::parse_http_date(raw).ok()?;
     Some(
         at.duration_since(std::time::SystemTime::now())
             .unwrap_or_default()
-            .min(Duration::from_secs(24 * 60 * 60)),
+            .min(Duration::from_secs(MAX_RETRY_DELAY_SECONDS)),
     )
+}
+
+fn parse_json_retry_after(value: Option<&Value>) -> Option<Duration> {
+    let seconds = value?
+        .pointer("/ratelimit/seconds")?
+        .as_u64()?
+        .min(MAX_RETRY_DELAY_SECONDS);
+    Some(Duration::from_secs(seconds))
+}
+
+fn longest_retry_delay(
+    header_delay: Option<Duration>,
+    json_delay: Option<Duration>,
+) -> Option<Duration> {
+    match (header_delay, json_delay) {
+        (Some(header), Some(json)) => Some(header.max(json)),
+        (Some(delay), None) | (None, Some(delay)) => Some(delay),
+        (None, None) => None,
+    }
 }
 
 fn oauth_scopes(headers: &HeaderMap) -> Vec<String> {
@@ -268,7 +288,7 @@ async fn checked(response: Response, operation: &'static str) -> Result<Response
     if status.is_success() {
         return Ok(response);
     }
-    let retry_after = parse_retry_after(response.headers().get(RETRY_AFTER));
+    let header_retry_after = parse_retry_after(response.headers().get(RETRY_AFTER));
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     let mut truncated = false;
@@ -295,6 +315,16 @@ async fn checked(response: Response, operation: &'static str) -> Result<Response
         body.push_str("… [truncated]");
     }
     let value = serde_json::from_slice::<Value>(&bytes).ok();
+    // Bot-vs-bot daily limits use structured JSON reset metadata instead of
+    // necessarily sending the standard Retry-After header. Prefer whichever
+    // explicit delay is longer so a generic header cannot make QueenUI retry
+    // before the server's daily window actually releases.
+    let retry_after = longest_retry_delay(
+        header_retry_after,
+        (status == StatusCode::TOO_MANY_REQUESTS)
+            .then(|| parse_json_retry_after(value.as_ref()))
+            .flatten(),
+    );
     let code = value.as_ref().and_then(|value| {
         value
             .pointer("/error/code")
@@ -807,8 +837,8 @@ pub async fn decline_challenge(
 mod tests {
     use super::{
         account, actionable_missing_scope_message, api_url, append_ndjson_chunk, create_challenge,
-        default_api_base, outgoing_challenges, parse_retry_after, site_url, take_lines,
-        validate_username, LichessErrorKind,
+        default_api_base, outgoing_challenges, parse_json_retry_after, parse_retry_after, site_url,
+        take_lines, validate_username, LichessErrorKind,
     };
     use crate::models::ChallengeRequest;
     use crate::test_support::{ScriptReply, ScriptedHttp};
@@ -877,6 +907,50 @@ mod tests {
         let date = HeaderValue::from_str(&httpdate::fmt_http_date(future)).unwrap();
         let parsed = parse_retry_after(Some(&date)).expect("HTTP-date Retry-After");
         assert!((Duration::from_secs(58)..=Duration::from_secs(60)).contains(&parsed));
+    }
+
+    #[test]
+    fn parses_structured_lichess_rate_limit_delay() {
+        let value = serde_json::json!({
+            "error": "You played 100 games against other bots today",
+            "ratelimit": { "key": "bot.vsBot.day", "seconds": 73_025 }
+        });
+        assert_eq!(
+            parse_json_retry_after(Some(&value)),
+            Some(Duration::from_secs(73_025))
+        );
+        assert_eq!(
+            parse_json_retry_after(Some(&serde_json::json!({
+                "ratelimit": { "seconds": "73025" }
+            }))),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn create_challenge_uses_daily_bot_limit_reset_delay() {
+        let http = ScriptedHttp::start().await;
+        http.push(
+            "POST",
+            "/api/challenge/Opponent",
+            ScriptReply::JsonWithHeaders(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":"You played 100 games against other bots today","ratelimit":{"key":"bot.vsBot.day","seconds":7325}}"#.into(),
+                vec![("retry-after", "60")],
+            ),
+        );
+
+        let error = create_challenge(
+            &http.base(),
+            &reqwest::Client::new(),
+            "token",
+            &challenge_request(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.retry_after, Some(Duration::from_secs(7_325)));
+        assert!(error.body.contains("bot.vsBot.day"));
     }
 
     #[test]

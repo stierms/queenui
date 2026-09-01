@@ -108,6 +108,22 @@ export function timeOfDayShort(ms: number) {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
+/** Compact countdown that remains readable for a rolling daily limit. */
+export function durationShortSeconds(seconds: number) {
+  const total = Math.max(0, Math.ceil(seconds));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  const remainingSeconds = total % 60;
+  if (minutes < 60) {
+    return remainingSeconds
+      ? `${minutes}m ${remainingSeconds}s`
+      : `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
 /**
  * A duration as `mm:ss`; `null` renders as an em dash. Minutes are padded to
  * two digits to match `formatClock`, which renders every board clock in the

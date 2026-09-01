@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   durationMmSs,
+  durationShortSeconds,
   formatBytes,
   relativeDay,
   relativeSince,
@@ -29,6 +30,13 @@ describe("format helpers", () => {
     expect(durationMmSs(65_400)).toBe("01:05");
     expect(durationMmSs(null)).toBe("—");
     expect(durationMmSs(-10)).toBe("00:00");
+  });
+
+  it("keeps long scheduler delays readable", () => {
+    expect(durationShortSeconds(9)).toBe("9s");
+    expect(durationShortSeconds(125)).toBe("2m 5s");
+    expect(durationShortSeconds(3_600)).toBe("1h");
+    expect(durationShortSeconds(73_025)).toBe("20h 17m");
   });
 
   it("describes ages in the coarsest useful unit", () => {
