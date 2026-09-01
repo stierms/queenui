@@ -585,20 +585,29 @@ describe("runner settings", () => {
   const couldNotVerify = (runner = RUNNER) =>
     `Could not verify the remote runner at ${runner}; it may still be playing games. Confirm that its games will keep running there before switching runners.`;
 
-  it("asks with the backend's own sentence, then resends it naming that runner", async () => {
-    const user = userEvent.setup();
-    // All four shapes `verify_remote_handover` can refuse with, in both numbers
-    // wherever the noun changes.
-    for (const refusal of [
-      stillPlaying(1),
-      stillPlaying(3),
-      owesChallenges(1),
-      owesChallenges(2),
-      playingAndOwesChallenges(1, 1),
-      playingAndOwesChallenges(3, 2),
-      couldNotVerify(),
-    ]) {
-      vi.mocked(commands.setRunnerSettings).mockReset();
+  // Each refusal is a complete render and confirmation flow. Keep them as
+  // independently isolated tests so a slower platform does not have to run
+  // seven UI scenarios inside one test's timeout budget.
+  const handoverRefusals = [
+    { name: "one live game", refusal: stillPlaying(1) },
+    { name: "multiple live games", refusal: stillPlaying(3) },
+    { name: "one outgoing challenge", refusal: owesChallenges(1) },
+    { name: "multiple outgoing challenges", refusal: owesChallenges(2) },
+    {
+      name: "one live game and challenge",
+      refusal: playingAndOwesChallenges(1, 1),
+    },
+    {
+      name: "multiple live games and challenges",
+      refusal: playingAndOwesChallenges(3, 2),
+    },
+    { name: "unreachable runner", refusal: couldNotVerify() },
+  ] as const;
+
+  it.each(handoverRefusals)(
+    "asks with the backend's own sentence, then resends it naming that runner: $name",
+    async ({ refusal }) => {
+      const user = userEvent.setup();
       vi.mocked(commands.setRunnerSettings)
         .mockRejectedValueOnce(refusal)
         .mockResolvedValueOnce(embeddedSettings);
@@ -650,9 +659,8 @@ describe("runner settings", () => {
         await screen.findByText("Switched to this computer's engine."),
       ).toBeInTheDocument();
       expect(screen.queryByRole("dialog")).toBeNull();
-      cleanup();
-    }
-  });
+    },
+  );
 
   it("names the question the refusal asked, and never the wrong one", async () => {
     /*
