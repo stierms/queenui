@@ -1,6 +1,6 @@
 [package]
 name = "queen-core"
-version = "0.1.4"
+version = "0.1.5"
 description = "Portable QueenUI game, engine, and persistence core"
 edition = "2021"
 license = "GPL-3.0-or-later"
