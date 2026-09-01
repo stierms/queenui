@@ -1,12 +1,119 @@
 use crate::models::OpeningBookConfig;
 use pgn_reader::{Reader, SanPlus, Visitor};
-use polyglot_book_rs::PolyglotBook;
+use polyglot_book_rs::polyglot_hash_from_fen;
 use rand::Rng;
 use shakmaty::{fen::Fen, uci::UciMove, CastlingMode, Chess, EnPassantMode, Position};
-use std::{collections::HashMap, fs::File, ops::ControlFlow, path::Path};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{self, BufReader, Read},
+    ops::ControlFlow,
+    path::Path,
+};
 
-pub const OPENING_BOOK_FILE_CAP: u64 = 64 * 1024 * 1024;
-pub const OPENING_BOOK_ENTRY_CAP: usize = 5_000_000;
+// Polyglot expands predictably to one compact record per 16-byte file entry,
+// so established libraries can have a higher bounded ceiling. PGN parsing
+// builds a hash map of positions and can expand far beyond its input size.
+pub const POLYGLOT_OPENING_BOOK_FILE_CAP: u64 = 512 * 1024 * 1024;
+pub const POLYGLOT_OPENING_BOOK_ENTRY_CAP: usize = 33_554_432;
+pub const PGN_OPENING_BOOK_FILE_CAP: u64 = 64 * 1024 * 1024;
+pub const PGN_OPENING_BOOK_ENTRY_CAP: usize = 5_000_000;
+const POLYGLOT_RECORD_BYTES: u64 = 16;
+const POLYGLOT_READ_BUFFER_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct RawPolyglotEntry {
+    key: u64,
+    move_data: u16,
+    weight: u16,
+}
+
+struct PolyglotBook {
+    entries: Vec<RawPolyglotEntry>,
+}
+
+impl PolyglotBook {
+    fn load(path: &str) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let file_size = file.metadata()?.len();
+        if file_size % POLYGLOT_RECORD_BYTES != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated 16-byte Polyglot entry",
+            ));
+        }
+
+        let entry_count = usize::try_from(file_size / POLYGLOT_RECORD_BYTES).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Polyglot entry count does not fit in memory",
+            )
+        })?;
+        let mut reader = BufReader::with_capacity(POLYGLOT_READ_BUFFER_BYTES, file);
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut record = [0_u8; POLYGLOT_RECORD_BYTES as usize];
+        let mut previous_key = None;
+        let mut already_sorted = true;
+
+        for _ in 0..entry_count {
+            reader.read_exact(&mut record)?;
+            let key = u64::from_be_bytes(record[0..8].try_into().expect("fixed key slice"));
+            if previous_key.is_some_and(|previous| previous > key) {
+                already_sorted = false;
+            }
+            previous_key = Some(key);
+            entries.push(RawPolyglotEntry {
+                key,
+                move_data: u16::from_be_bytes(record[8..10].try_into().expect("fixed move slice")),
+                weight: u16::from_be_bytes(record[10..12].try_into().expect("fixed weight slice")),
+            });
+        }
+
+        if !already_sorted {
+            entries.sort_unstable_by_key(|entry| entry.key);
+        }
+        Ok(Self { entries })
+    }
+
+    fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn moves_for_fen(&self, fen: &str) -> Vec<BookMove> {
+        let Ok(key) = polyglot_hash_from_fen(fen) else {
+            return Vec::new();
+        };
+        let start = self.entries.partition_point(|entry| entry.key < key);
+        let end = self.entries.partition_point(|entry| entry.key <= key);
+        self.entries[start..end]
+            .iter()
+            .map(|entry| BookMove {
+                uci: decode_polyglot_move(entry.move_data),
+                weight: u32::from(entry.weight),
+            })
+            .collect()
+    }
+}
+
+fn decode_polyglot_move(move_data: u16) -> String {
+    let from = ((move_data >> 6) & 0x3f) as u8;
+    let to = (move_data & 0x3f) as u8;
+    let mut uci = String::with_capacity(5);
+    for square in [from, to] {
+        uci.push(char::from(b'a' + square % 8));
+        uci.push(char::from(b'1' + square / 8));
+    }
+    if let Some(promotion) = match (move_data >> 12) & 0x7 {
+        1 => Some('n'),
+        2 => Some('b'),
+        3 => Some('r'),
+        4 => Some('q'),
+        _ => None,
+    } {
+        uci.push(promotion);
+    }
+    uci
+}
 
 pub struct OpeningBook {
     config: OpeningBookConfig,
@@ -47,13 +154,19 @@ impl PreparedBook {
 
 impl OpeningBook {
     pub fn load(config: &OpeningBookConfig) -> Result<Self, String> {
-        enforce_file_cap(Path::new(&config.path))?;
+        let path = Path::new(&config.path);
         let source = match config.format.as_str() {
-            "polyglot" => BookSource::Polyglot(
-                PolyglotBook::load(&config.path)
-                    .map_err(|error| format!("Could not load Polyglot book: {error}"))?,
-            ),
-            "pgn" => BookSource::Pgn(load_pgn(&config.path)?.0),
+            "polyglot" => {
+                enforce_polyglot_size(path)?;
+                let book = PolyglotBook::load(&config.path)
+                    .map_err(|error| format!("Could not load Polyglot book: {error}"))?;
+                enforce_polyglot_entry_cap(book.entry_count())?;
+                BookSource::Polyglot(book)
+            }
+            "pgn" => {
+                enforce_file_cap(path, PGN_OPENING_BOOK_FILE_CAP, "PGN")?;
+                BookSource::Pgn(load_pgn(&config.path)?.0)
+            }
             _ => {
                 return Err(format!(
                     "Unsupported opening-book format: {}",
@@ -75,13 +188,11 @@ impl OpeningBook {
         let position = position_after(initial_fen, moves).ok()?;
         let mut candidates = match &self.source {
             BookSource::Polyglot(book) => book
-                .get_all_moves_from_fen(
-                    &Fen::from_position(&position, EnPassantMode::Legal).to_string(),
-                )
+                .moves_for_fen(&Fen::from_position(&position, EnPassantMode::Legal).to_string())
                 .into_iter()
-                .map(|entry| BookMove {
-                    uci: normalize_polyglot_castling(entry.move_string),
-                    weight: u32::from(entry.weight),
+                .map(|mut entry| {
+                    entry.uci = normalize_polyglot_castling(entry.uci);
+                    entry
                 })
                 .collect(),
             BookSource::Pgn(positions) => positions
@@ -120,7 +231,6 @@ pub fn prepare(path: &str) -> Result<PreparedBook, String> {
     if !path.is_file() {
         return Err("The selected opening-book file does not exist.".into());
     }
-    enforce_file_cap(path)?;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -133,16 +243,13 @@ pub fn prepare(path: &str) -> Result<PreparedBook, String> {
         .as_deref()
     {
         Some("bin") => {
+            enforce_polyglot_size(path)?;
             let book = PolyglotBook::load(path.to_string_lossy().as_ref())
                 .map_err(|error| format!("Could not read Polyglot book: {error}"))?;
             if book.entry_count() == 0 {
                 return Err("The selected Polyglot book contains no entries.".into());
             }
-            if book.entry_count() > OPENING_BOOK_ENTRY_CAP {
-                return Err(format!(
-                    "The Polyglot book exceeds the {OPENING_BOOK_ENTRY_CAP}-entry safety limit"
-                ));
-            }
+            enforce_polyglot_entry_cap(book.entry_count())?;
             Ok(PreparedBook {
                 inspection: BookInspection {
                     name,
@@ -153,6 +260,7 @@ pub fn prepare(path: &str) -> Result<PreparedBook, String> {
             })
         }
         Some("pgn") => {
+            enforce_file_cap(path, PGN_OPENING_BOOK_FILE_CAP, "PGN")?;
             let (positions, entry_count) = load_pgn(path.to_string_lossy().as_ref())?;
             if entry_count == 0 {
                 return Err("The selected PGN contains no legal mainline moves.".into());
@@ -170,15 +278,32 @@ pub fn prepare(path: &str) -> Result<PreparedBook, String> {
     }
 }
 
-fn enforce_file_cap(path: &Path) -> Result<(), String> {
+fn enforce_file_cap(path: &Path, cap: u64, format: &str) -> Result<u64, String> {
     let size = path
         .metadata()
         .map_err(|error| format!("Could not inspect opening-book size: {error}"))?
         .len();
-    if size > OPENING_BOOK_FILE_CAP {
+    if size > cap {
         return Err(format!(
-            "Opening books are limited to {} MiB",
-            OPENING_BOOK_FILE_CAP / 1024 / 1024
+            "{format} opening books are limited to {} MiB",
+            cap / 1024 / 1024
+        ));
+    }
+    Ok(size)
+}
+
+fn enforce_polyglot_size(path: &Path) -> Result<(), String> {
+    let size = enforce_file_cap(path, POLYGLOT_OPENING_BOOK_FILE_CAP, "Polyglot")?;
+    if size % 16 != 0 {
+        return Err("The selected Polyglot book has a truncated 16-byte entry".into());
+    }
+    Ok(())
+}
+
+fn enforce_polyglot_entry_cap(entry_count: usize) -> Result<(), String> {
+    if entry_count > POLYGLOT_OPENING_BOOK_ENTRY_CAP {
+        return Err(format!(
+            "The Polyglot book exceeds the {POLYGLOT_OPENING_BOOK_ENTRY_CAP}-entry safety limit"
         ));
     }
     Ok(())
@@ -238,9 +363,9 @@ fn load_pgn(path: &str) -> Result<(HashMap<String, Vec<BookMove>>, usize), Strin
         entries = entries
             .checked_add(game.len())
             .ok_or_else(|| "PGN opening-book entry count overflowed".to_string())?;
-        if entries > OPENING_BOOK_ENTRY_CAP {
+        if entries > PGN_OPENING_BOOK_ENTRY_CAP {
             return Err(format!(
-                "The PGN book exceeds the {OPENING_BOOK_ENTRY_CAP}-entry safety limit"
+                "The PGN book exceeds the {PGN_OPENING_BOOK_ENTRY_CAP}-entry safety limit"
             ));
         }
         for (position, chess_move) in game {
@@ -305,8 +430,8 @@ impl Visitor for PgnGameVisitor {
 #[cfg(test)]
 mod tests {
     use super::{
-        inspect, normalize_polyglot_castling, position_after, position_key, OpeningBook,
-        OPENING_BOOK_FILE_CAP,
+        decode_polyglot_move, inspect, normalize_polyglot_castling, position_after, position_key,
+        OpeningBook, PGN_OPENING_BOOK_FILE_CAP, POLYGLOT_OPENING_BOOK_FILE_CAP,
     };
     use crate::models::OpeningBookConfig;
     use shakmaty::Chess;
@@ -322,6 +447,49 @@ mod tests {
     fn converts_polyglot_castling_to_standard_uci() {
         assert_eq!(normalize_polyglot_castling("e1h1".into()), "e1g1");
         assert_eq!(normalize_polyglot_castling("e7e5".into()), "e7e5");
+        assert_eq!(decode_polyglot_move((12 << 6) | 28), "e2e4");
+        assert_eq!(decode_polyglot_move((55 << 6) | 63 | (4 << 12)), "h7h8q");
+    }
+
+    #[test]
+    fn loads_sorted_and_unsorted_polyglot_records_with_buffered_lookup() {
+        const START_POSITION_KEY: u64 = 0x463b_9618_1691_fc9c;
+
+        fn record(key: u64, move_data: u16, weight: u16) -> [u8; 16] {
+            let mut record = [0_u8; 16];
+            record[0..8].copy_from_slice(&key.to_be_bytes());
+            record[8..10].copy_from_slice(&move_data.to_be_bytes());
+            record[10..12].copy_from_slice(&weight.to_be_bytes());
+            record
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "queenui-book-buffered-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        let mut bytes = Vec::new();
+        // Deliberately put a later key first to exercise the unsorted fallback.
+        bytes.extend_from_slice(&record(START_POSITION_KEY + 1, (6 << 6) | 21, 1));
+        bytes.extend_from_slice(&record(START_POSITION_KEY, (11 << 6) | 27, 1));
+        bytes.extend_from_slice(&record(START_POSITION_KEY, (12 << 6) | 28, 2));
+        fs::write(&path, bytes).expect("write Polyglot book");
+
+        let path_string = path.to_string_lossy().to_string();
+        let inspection = inspect(&path_string).expect("inspect Polyglot book");
+        assert_eq!(inspection.format, "polyglot");
+        assert_eq!(inspection.entry_count, 3);
+        let book = OpeningBook::load(&OpeningBookConfig {
+            enabled: true,
+            path: path_string,
+            name: inspection.name,
+            format: inspection.format,
+            max_plies: 8,
+            top_move_percent: 50,
+            entry_count: inspection.entry_count,
+        })
+        .expect("load Polyglot book");
+        assert_eq!(book.choose_move("startpos", "").as_deref(), Some("e2e4"));
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -352,14 +520,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_books_before_parsing() {
+    fn rejects_oversized_pgn_books_before_parsing() {
         let path =
             std::env::temp_dir().join(format!("queenui-book-cap-{}.pgn", uuid::Uuid::new_v4()));
         let file = fs::File::create(&path).expect("create sparse PGN");
-        file.set_len(OPENING_BOOK_FILE_CAP + 1)
+        file.set_len(PGN_OPENING_BOOK_FILE_CAP + 1)
             .expect("extend sparse PGN");
         let error = inspect(path.to_string_lossy().as_ref()).unwrap_err();
-        assert!(error.contains("64 MiB"));
+        assert!(error.contains("PGN opening books are limited to 64 MiB"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_oversized_or_truncated_polyglot_books_before_parsing() {
+        let oversized =
+            std::env::temp_dir().join(format!("queenui-book-cap-{}.bin", uuid::Uuid::new_v4()));
+        let file = fs::File::create(&oversized).expect("create sparse Polyglot book");
+        file.set_len(POLYGLOT_OPENING_BOOK_FILE_CAP + 16)
+            .expect("extend sparse Polyglot book");
+        let error = inspect(oversized.to_string_lossy().as_ref()).unwrap_err();
+        assert!(error.contains("Polyglot opening books are limited to 512 MiB"));
+        let _ = fs::remove_file(oversized);
+
+        let truncated = std::env::temp_dir().join(format!(
+            "queenui-book-truncated-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&truncated, [0; 15]).expect("write truncated Polyglot book");
+        let error = inspect(truncated.to_string_lossy().as_ref()).unwrap_err();
+        assert!(error.contains("truncated 16-byte entry"));
+        let _ = fs::remove_file(truncated);
     }
 }
