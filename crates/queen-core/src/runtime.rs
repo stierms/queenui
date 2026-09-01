@@ -1256,14 +1256,12 @@ impl AppState {
 
         let state = self.clone();
         let supervisor_account = account.clone();
-        let supervisor_engine = engine.clone();
         let supervisor_token = token.clone();
         let supervisor_cancellation = cancellation.clone();
         let supervisor_account_id = supervisor_account.id.clone();
         let supervisor_future = run_supervisor(
             state.clone(),
             supervisor_account,
-            supervisor_engine,
             supervisor_token,
             supervisor_cancellation,
             generation,
@@ -2323,33 +2321,11 @@ pub async fn remove_engine(engine_id: String, state: CoreStateRef<'_>) -> Result
     Ok(())
 }
 
-async fn ensure_engine_idle(state: &AppState, engine_id: &str) -> Result<(), String> {
-    let assigned_accounts: Vec<_> = state
-        .0
-        .config
-        .read()
-        .await
-        .accounts
-        .iter()
-        .filter(|account| account.engine_id == engine_id)
-        .map(|account| account.id.clone())
-        .collect();
-    let supervisors = state.0.supervisors.lock().await;
-    if assigned_accounts
-        .iter()
-        .any(|account_id| supervisors.contains_key(account_id))
-    {
-        return Err("Stop every bot using this engine before changing its configuration.".into());
-    }
-    Ok(())
-}
-
 pub async fn update_engine_options(
     engine_id: String,
     options: Vec<EngineOptionUpdate>,
     state: CoreStateRef<'_>,
 ) -> Result<(), String> {
-    ensure_engine_idle(state.inner(), &engine_id).await?;
     let mut config = state.0.config.write().await;
     let engine = config
         .engines
@@ -2375,7 +2351,6 @@ pub async fn refresh_engine_options(
     engine_id: String,
     state: CoreStateRef<'_>,
 ) -> Result<(), String> {
-    ensure_engine_idle(state.inner(), &engine_id).await?;
     let path = state
         .0
         .config
@@ -2557,7 +2532,6 @@ pub async fn configure_opening_book(
     if !(1..=100).contains(&request.top_move_percent) {
         return Err("Top-move selection must be between 1% and 100%.".into());
     }
-    ensure_engine_idle(state.inner(), &request.engine_id).await?;
     let (existing_name, previous_path) = state
         .0
         .config
@@ -2629,7 +2603,6 @@ pub async fn clear_engine_opening_book(
     engine_id: String,
     state: CoreStateRef<'_>,
 ) -> Result<(), String> {
-    ensure_engine_idle(state.inner(), &engine_id).await?;
     let mut config = state.0.config.write().await;
     let engine = config
         .engines
@@ -3005,7 +2978,6 @@ pub async fn create_challenge(
 async fn run_supervisor(
     state: AppState,
     account: AccountProfile,
-    engine: EngineProfile,
     token: String,
     cancellation: CancellationToken,
     generation: u64,
@@ -3044,7 +3016,6 @@ async fn run_supervisor(
                                         match handle_account_event(
                                             &state,
                                             &account,
-                                            &engine,
                                             &token,
                                             &cancellation,
                                             generation,
@@ -3120,10 +3091,25 @@ async fn run_supervisor(
     }
 }
 
+async fn engine_profile_for_game_start(
+    state: &AppState,
+    account: &AccountProfile,
+) -> Result<EngineProfile, String> {
+    state
+        .0
+        .config
+        .read()
+        .await
+        .engines
+        .iter()
+        .find(|engine| engine.id == account.engine_id)
+        .cloned()
+        .ok_or_else(|| "The account's engine profile no longer exists".to_string())
+}
+
 async fn handle_account_event(
     state: &AppState,
     account: &AccountProfile,
-    engine: &EngineProfile,
     token: &str,
     cancellation: &CancellationToken,
     generation: u64,
@@ -3211,10 +3197,14 @@ async fn handle_account_event(
     if !already_active {
         campaign::record_account_event(state, &account.id, event_type, &event).await;
     }
+    // A connected supervisor is long-lived, but engine policy is not. Read the
+    // profile at the game-start boundary so saved UCI and book changes apply to
+    // the next engine process without mutating any process already playing.
+    let engine = engine_profile_for_game_start(state, account).await?;
     let result = state
         .spawn_game_task(
             account.clone(),
-            engine.clone(),
+            engine,
             token.to_string(),
             game_id.clone(),
             cancellation.child_token(),
@@ -5726,17 +5716,19 @@ mod submission_safety_tests {
 #[cfg(test)]
 mod owned_lifecycle_acceptance_tests {
     use super::{
-        add_lichess_account, create_challenge, handle_account_event, remove_lichess_account,
+        add_lichess_account, configure_opening_book, create_challenge,
+        engine_profile_for_game_start, handle_account_event, remove_lichess_account,
         spawn_game_wrapper, spawn_supervisor_wrapper, update_lichess_account_token, AppState,
         CoreStateRef, GameTask, SupervisorTask, TASK_JOIN_TIMEOUT,
     };
     #[cfg(not(windows))]
     use super::{process_game_event, GameContext, MoveTransport, SubmissionCoordinator};
-    use crate::models::{AddAccountRequest, CampaignSettings, ChallengeRequest};
+    use crate::models::{AddAccountRequest, CampaignSettings, ChallengeRequest, OpeningBookUpdate};
     use crate::storage::{self, FileSecretStore, SecretStore};
     use crate::test_support::{
         app_config, temp_root, MemorySecretStore, ScriptReply, ScriptedHttp,
     };
+    #[cfg(not(windows))]
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -5770,6 +5762,55 @@ mod owned_lifecycle_acceptance_tests {
             },
         );
         state.set_runtime("bot", "online", None).await;
+    }
+
+    #[tokio::test]
+    async fn connected_supervisor_uses_saved_book_policy_at_the_next_game_boundary() {
+        let root = temp_root("connected-book-update");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("approved.bin");
+        std::fs::write(&source, [0_u8; 16]).unwrap();
+        let state = AppState::new_with_secret_store(
+            root.clone(),
+            app_config("unused-engine", true),
+            Arc::new(MemorySecretStore::with("bot", "token")),
+        )
+        .unwrap();
+        install_online_supervisor(&state, 1).await;
+        let config = state.0.config.read().await;
+        let account = config.accounts[0].clone();
+        let active_game_profile = config.engines[0].clone();
+        drop(config);
+
+        let saved = configure_opening_book(
+            OpeningBookUpdate {
+                engine_id: "engine".into(),
+                path: source.to_string_lossy().to_string(),
+                enabled: true,
+                max_plies: 20,
+                top_move_percent: 10,
+            },
+            CoreStateRef::new(&state),
+        )
+        .await
+        .expect("save book while the account supervisor remains connected");
+        let next_game_profile = engine_profile_for_game_start(&state, &account)
+            .await
+            .expect("resolve the current engine policy");
+
+        assert!(active_game_profile.opening_book.is_none());
+        assert_eq!(
+            next_game_profile
+                .opening_book
+                .as_ref()
+                .map(|book| book.path.as_str()),
+            Some(saved.path.as_str())
+        );
+        assert!(state.0.supervisors.lock().await.contains_key("bot"));
+
+        state.stop_bot_owned("bot", false, false).await.unwrap();
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -5963,7 +6004,6 @@ mod owned_lifecycle_acceptance_tests {
         install_online_supervisor(&state, 1).await;
         let config = state.0.config.read().await;
         let account = config.accounts[0].clone();
-        let engine = config.engines[0].clone();
         drop(config);
         state
             .remember_known_outgoing_challenge("bot", "challenge", "Opponent")
@@ -5973,7 +6013,6 @@ mod owned_lifecycle_acceptance_tests {
         let error = handle_account_event(
             &state,
             &account,
-            &engine,
             "token",
             &CancellationToken::new(),
             1,
@@ -6043,7 +6082,6 @@ mod owned_lifecycle_acceptance_tests {
         install_online_supervisor(&state, 1).await;
         let config = state.0.config.read().await;
         let account = config.accounts[0].clone();
-        let engine = config.engines[0].clone();
         drop(config);
         state
             .remember_known_outgoing_challenge("bot", "challenge", "Opponent")
@@ -6053,7 +6091,6 @@ mod owned_lifecycle_acceptance_tests {
         handle_account_event(
             &state,
             &account,
-            &engine,
             "token",
             &CancellationToken::new(),
             1,
@@ -6444,7 +6481,6 @@ mod owned_lifecycle_acceptance_tests {
             .await;
         let config = state.0.config.read().await;
         let account = config.accounts[0].clone();
-        let engine = config.engines[0].clone();
         drop(config);
         let quiesce = state.quiesce().await;
 
@@ -6455,7 +6491,6 @@ mod owned_lifecycle_acceptance_tests {
             handle_account_event(
                 &state,
                 &account,
-                &engine,
                 "token",
                 &CancellationToken::new(),
                 1,
@@ -7059,12 +7094,10 @@ mod owned_lifecycle_acceptance_tests {
             .await;
         let config = state.0.config.read().await;
         let account = config.accounts[0].clone();
-        let engine = config.engines[0].clone();
         drop(config);
         handle_account_event(
             &state,
             &account,
-            &engine,
             "token",
             &CancellationToken::new(),
             1,

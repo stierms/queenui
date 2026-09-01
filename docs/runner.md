@@ -232,8 +232,12 @@ content-addressed copy after a runner-side UCI probe. The desktop neither knows
 nor submits the root's absolute host path. Remote upload and free-form path
 registration are deliberately unavailable.
 
-Opening books are runner-opened files, so remote paths are accepted only when
-they exactly match an administrator-provided `opening_book_allowlist` entry.
+Opening books are runner-opened files. Current runners expose only the
+administrator-provided `opening_book_allowlist` entries through an authenticated
+asset selector, so the desktop does not require operators to type an exact
+runner path. The runner also accepts the exact managed copy already attached to
+that engine when only its policy is being edited; no other arbitrary path is
+accepted.
 UCI option values are different: the runner passes them to the trusted engine
 without an administrator value allowlist. Those values are the operator's
 decision, while the administrator's trust decision is the executable itself.

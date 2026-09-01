@@ -26,6 +26,7 @@ import type {
   EngineBrowseRequest,
   EngineBrowseResponse,
   EngineRoot,
+  OpeningBookAsset,
 } from "../types";
 
 export function getRunnerSettings(): Promise<RunnerSettingsView> {
@@ -108,6 +109,10 @@ export function browseEngineRoot(
   request: EngineBrowseRequest,
 ): Promise<EngineBrowseResponse> {
   return invoke<EngineBrowseResponse>("browse_engine_root", { request });
+}
+
+export function listOpeningBookAssets(): Promise<OpeningBookAsset[]> {
+  return invoke<OpeningBookAsset[]>("list_opening_book_assets");
 }
 
 export function registerEngine(

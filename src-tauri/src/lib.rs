@@ -8,8 +8,8 @@ use queen_core::{
     AppState, CoreEvent, CoreStateRef,
 };
 use queen_protocol::{
-    EngineBrowseRequest, EngineBrowseResponse, EngineRoot, RunnerCommand, RunnerIdentity,
-    PAIRING_PAYLOAD_VERSION,
+    EngineBrowseRequest, EngineBrowseResponse, EngineRoot, OpeningBookAsset, RunnerCommand,
+    RunnerIdentity, PAIRING_PAYLOAD_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -612,6 +612,19 @@ async fn browse_engine_root(
         DispatchTarget::Remote(client) => client.browse_engines(request).await,
         DispatchTarget::Embedded(_) => {
             Err("The scoped engine browser is only available with a remote runner".into())
+        }
+    }
+}
+
+#[tauri::command]
+async fn list_opening_book_assets(
+    state: State<'_, BackendState>,
+) -> Result<Vec<OpeningBookAsset>, String> {
+    let dispatch = state.dispatch_backend()?;
+    match dispatch.target() {
+        DispatchTarget::Remote(client) => client.opening_book_assets().await,
+        DispatchTarget::Embedded(_) => {
+            Err("Approved opening-book assets are only available with a remote runner".into())
         }
     }
 }
@@ -2316,6 +2329,7 @@ pub fn run() {
             add_engine,
             list_engine_roots,
             browse_engine_root,
+            list_opening_book_assets,
             register_engine,
             remove_engine,
             update_engine_options,
@@ -2909,6 +2923,7 @@ mod tests {
         push::<diagnostics::DiagnosticEntry>(&mut output);
         push::<diagnostics::DiagnosticFilter>(&mut output);
         push::<queen_protocol::EngineRoot>(&mut output);
+        push::<queen_protocol::OpeningBookAsset>(&mut output);
         push::<queen_protocol::EngineBrowseEntryKind>(&mut output);
         push::<queen_protocol::EngineBrowseEntry>(&mut output);
         push::<queen_protocol::EngineBrowseRequest>(&mut output);

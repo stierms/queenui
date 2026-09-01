@@ -2,12 +2,13 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use queen_core::{AppState, CoreStateRef};
 use queen_protocol::{
     EngineBrowseEntry, EngineBrowseEntryKind, EngineBrowseRequest, EngineBrowseResponse,
-    EngineRoot, ENGINE_BROWSE_DEFAULT_PAGE_ENTRIES, ENGINE_BROWSE_MAX_PAGE_ENTRIES,
+    EngineRoot, OpeningBookAsset, ENGINE_BROWSE_DEFAULT_PAGE_ENTRIES,
+    ENGINE_BROWSE_MAX_PAGE_ENTRIES,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -26,6 +27,7 @@ const BROWSE_TIMEOUT: Duration = Duration::from_millis(750);
 const CURSOR_TTL: Duration = Duration::from_secs(60);
 const MAX_CURSORS: usize = 128;
 const MAX_STORE_ENTRIES: usize = 4096;
+const MAX_OPENING_BOOK_ASSETS: usize = 1024;
 const BROWSE_RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_BROWSES_PER_WINDOW: usize = 120;
 const STORE_DIRECTORY: &str = "engine-store";
@@ -120,8 +122,9 @@ impl AvailabilityLimits {
 struct RunnerConfig {
     engine_admin: EngineAdminMode,
     engine_roots: Vec<RootConfig>,
-    /// Exact administrator-provided opening-book paths. These remain a
-    /// config-file-only compatibility form until the asset browser lands.
+    /// Exact administrator-provided opening-book paths. Authenticated desktops
+    /// receive these through the bounded asset-list endpoint; the configuration
+    /// file remains the runner administrator's trust boundary.
     opening_book_allowlist: Vec<PathBuf>,
     limits: AvailabilityLimits,
 }
@@ -184,6 +187,9 @@ impl EngineAdmin {
         if config.engine_admin == EngineAdminMode::SecureInstall {
             return Err("engine_admin=secure-install is reserved until the containment preflight is implemented".into());
         }
+        if config.opening_book_allowlist.len() > MAX_OPENING_BOOK_ASSETS {
+            return Err("opening_book_allowlist contains too many assets".into());
+        }
         config.limits.validate()?;
         let mut roots = HashMap::new();
         let mut root_order = Vec::new();
@@ -201,6 +207,7 @@ impl EngineAdmin {
             "The private content-addressed engine store could not be created".to_string()
         })?;
         set_directory_mode(&store, 0o755)?;
+        let mut opening_book_paths = HashSet::new();
         let opening_book_allowlist = config
             .opening_book_allowlist
             .into_iter()
@@ -208,8 +215,16 @@ impl EngineAdmin {
                 if !path.is_absolute() {
                     return Err("opening_book_allowlist entries must be absolute".to_string());
                 }
-                path.canonicalize()
-                    .map_err(|_| "An opening_book_allowlist entry is unavailable".to_string())
+                let canonical = path
+                    .canonicalize()
+                    .map_err(|_| "An opening_book_allowlist entry is unavailable".to_string())?;
+                if !canonical.is_file() {
+                    return Err("opening_book_allowlist entries must be regular files".to_string());
+                }
+                if !opening_book_paths.insert(canonical.clone()) {
+                    return Err("opening_book_allowlist contains a duplicate asset".to_string());
+                }
+                Ok(canonical)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let blocking_workers = config.limits.blocking_workers;
@@ -231,6 +246,41 @@ impl EngineAdmin {
             .iter()
             .filter_map(|id| self.roots.get(id).map(|root| root.public.clone()))
             .collect()
+    }
+
+    pub(crate) async fn opening_books(&self) -> Result<Vec<OpeningBookAsset>, String> {
+        let paths = self.opening_book_allowlist.clone();
+        let permit = self
+            .browse_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "The opening-book asset list is at its concurrency limit".to_string())?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            paths
+                .iter()
+                .filter_map(|path| {
+                    if path.canonicalize().ok().as_ref() != Some(path) {
+                        return None;
+                    }
+                    let metadata = path.metadata().ok()?;
+                    if !metadata.is_file() {
+                        return None;
+                    }
+                    Some(OpeningBookAsset {
+                        path: path.to_string_lossy().to_string(),
+                        name: path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("Opening book")
+                            .to_string(),
+                        size: metadata.len(),
+                    })
+                })
+                .collect()
+        })
+        .await
+        .map_err(|_| "The opening-book asset worker stopped unexpectedly".to_string())
     }
 
     pub(crate) fn blocking_admission(&self) -> Arc<Semaphore> {
@@ -408,19 +458,26 @@ impl EngineAdmin {
         Ok(())
     }
 
-    pub(crate) fn validate_opening_book(&self, requested: &str) -> Result<String, String> {
-        let path = PathBuf::from(requested);
+    pub(crate) fn validate_opening_book(
+        &self,
+        requested: &str,
+        current_managed_path: Option<&str>,
+    ) -> Result<String, String> {
+        let path = PathBuf::from(requested.trim());
         if !path.is_absolute() {
             return Err("Remote opening books require an administrator-allowlisted asset".into());
         }
         let canonical = path
             .canonicalize()
             .map_err(|_| "The selected administrator asset is unavailable".to_string())?;
-        if !self
+        let allowlisted = self
             .opening_book_allowlist
             .iter()
-            .any(|allowed| allowed == &canonical)
-        {
+            .any(|allowed| allowed == &canonical);
+        let current_managed = current_managed_path
+            .and_then(|current| Path::new(current).canonicalize().ok())
+            .is_some_and(|current| current == canonical);
+        if !allowlisted && !current_managed {
             return Err("Remote opening books require an administrator-allowlisted asset".into());
         }
         Ok(canonical.to_string_lossy().to_string())
@@ -1538,6 +1595,65 @@ mod tests {
         };
         assert!(error.contains("reserved"));
         let _ = fs::remove_dir_all(data);
+    }
+
+    #[tokio::test]
+    async fn approved_opening_books_are_listed_and_current_managed_copy_is_reusable() {
+        let data = temp_root("opening-book-assets-data");
+        let root = temp_root("opening-book-assets-root");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let approved = data.join("Cerebellum.bin");
+        fs::write(&approved, [0_u8; 32]).unwrap();
+        fs::write(
+            data.join("runner-config.json"),
+            serde_json::json!({
+                "engine_admin": "admin-installed",
+                "engine_roots": [{"id": "trusted", "path": root}],
+                "opening_book_allowlist": [approved],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let admin = EngineAdmin::load(&data).unwrap();
+        let approved = approved.canonicalize().unwrap();
+        assert_eq!(
+            admin.opening_books().await.unwrap(),
+            vec![queen_protocol::OpeningBookAsset {
+                path: approved.to_string_lossy().to_string(),
+                name: "Cerebellum.bin".into(),
+                size: 32,
+            }]
+        );
+        assert_eq!(
+            admin
+                .validate_opening_book(&format!("  {}  ", approved.to_string_lossy()), None,)
+                .unwrap(),
+            approved.to_string_lossy()
+        );
+
+        let managed_directory = data.join("opening-books");
+        fs::create_dir_all(&managed_directory).unwrap();
+        let managed = managed_directory.join("engine.bin");
+        fs::write(&managed, [1_u8; 16]).unwrap();
+        assert!(admin
+            .validate_opening_book(managed.to_str().unwrap(), None)
+            .is_err());
+        assert_eq!(
+            admin
+                .validate_opening_book(managed.to_str().unwrap(), Some(managed.to_str().unwrap()),)
+                .unwrap(),
+            managed.canonicalize().unwrap().to_string_lossy()
+        );
+
+        let rogue = data.join("rogue.bin");
+        fs::write(&rogue, [2_u8; 16]).unwrap();
+        assert!(admin
+            .validate_opening_book(rogue.to_str().unwrap(), Some(managed.to_str().unwrap()),)
+            .is_err());
+        let _ = fs::remove_dir_all(data);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

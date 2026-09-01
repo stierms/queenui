@@ -241,6 +241,13 @@ export type EngineRoot = {
  */
 id: string, label: string, };
 
+export type OpeningBookAsset = {
+/**
+ * Canonical runner-local path. Only entries from the administrator's
+ * opening-book allowlist are exposed here.
+ */
+path: string, name: string, size: number, };
+
 export type EngineBrowseEntryKind = "directory" | "file";
 
 export type EngineBrowseEntry = { name: string, relativePath: string, kind: EngineBrowseEntryKind, size: number, modifiedAtMs: number | null, executable: boolean, };

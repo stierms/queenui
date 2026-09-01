@@ -2,10 +2,10 @@ use futures_util::StreamExt;
 use queen_core::models::AppSnapshot;
 use queen_protocol::{
     command_body_digest, CommandRequest, CommandResponse, EngineBrowseRequest,
-    EngineBrowseResponse, EngineRoot, EventEnvelope, HandoverInventory, PairRedeemRequest,
-    PairRedeemResponse, RunnerCapabilities, RunnerCommand, RunnerIdentity, SnapshotResponse,
-    CAMPAIGN_COMPLETED_GAME_LIMIT_FEATURE, CAMPAIGN_SCHEDULING_FEATURE, CONTENT_SHA256_HEADER,
-    PAIRING_PAYLOAD_VERSION, PROTOCOL_VERSION,
+    EngineBrowseResponse, EngineRoot, EventEnvelope, HandoverInventory, OpeningBookAsset,
+    PairRedeemRequest, PairRedeemResponse, RunnerCapabilities, RunnerCommand, RunnerIdentity,
+    SnapshotResponse, CAMPAIGN_COMPLETED_GAME_LIMIT_FEATURE, CAMPAIGN_SCHEDULING_FEATURE,
+    CONTENT_SHA256_HEADER, OPENING_BOOK_ASSETS_FEATURE, PAIRING_PAYLOAD_VERSION, PROTOCOL_VERSION,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use rustls::{
@@ -112,6 +112,18 @@ impl RunnerClient {
 
     pub async fn engine_roots(&self) -> Result<Vec<EngineRoot>, String> {
         self.get("/v2/engines/roots").await
+    }
+
+    pub async fn opening_book_assets(&self) -> Result<Vec<OpeningBookAsset>, String> {
+        let capabilities = self.capabilities().await?;
+        if !capabilities
+            .features
+            .iter()
+            .any(|feature| feature == OPENING_BOOK_ASSETS_FEATURE)
+        {
+            return Err("Upgrade the paired runner before browsing approved opening books".into());
+        }
+        self.get("/v2/opening-books").await
     }
 
     pub async fn browse_engines(

@@ -21,10 +21,10 @@ use queen_core::{storage::FileSecretStore, AppState, CoreEvent, CoreStateRef};
 use queen_protocol::{
     command_body_digest, CommandRequest, CommandResponse, EngineBrowseRequest,
     EngineBrowseResponse, EngineRoot, EventEnvelope, HandoverInventory, HealthResponse,
-    PairRedeemRequest, PairRedeemResponse, PendingResponse, RunnerCapabilities, RunnerCommand,
-    SnapshotResponse, CAMPAIGN_COMPLETED_GAME_LIMIT_FEATURE, CAMPAIGN_SCHEDULING_FEATURE,
-    CONTENT_SHA256_HEADER, IDEMPOTENCY_PENDING_WAIT_SECONDS, PAIRING_PAYLOAD_VERSION,
-    PROTOCOL_VERSION,
+    OpeningBookAsset, PairRedeemRequest, PairRedeemResponse, PendingResponse, RunnerCapabilities,
+    RunnerCommand, SnapshotResponse, CAMPAIGN_COMPLETED_GAME_LIMIT_FEATURE,
+    CAMPAIGN_SCHEDULING_FEATURE, CONTENT_SHA256_HEADER, IDEMPOTENCY_PENDING_WAIT_SECONDS,
+    OPENING_BOOK_ASSETS_FEATURE, PAIRING_PAYLOAD_VERSION, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use std::{
@@ -388,6 +388,7 @@ fn router(state: ServerState) -> Router {
         .route("/v2/commands", post(command))
         .route("/v2/engines/roots", get(engine_roots))
         .route("/v2/engines/browse", post(browse_engines))
+        .route("/v2/opening-books", get(opening_books))
         .route("/v2/engines/upload", post(disabled_engine_install))
         .route("/v2/engines/register-path", post(disabled_engine_install))
         .route("/v2/events", get(events))
@@ -448,6 +449,7 @@ async fn capabilities(
         features: vec![
             CAMPAIGN_SCHEDULING_FEATURE.into(),
             CAMPAIGN_COMPLETED_GAME_LIMIT_FEATURE.into(),
+            OPENING_BOOK_ASSETS_FEATURE.into(),
         ],
     }))
 }
@@ -470,6 +472,19 @@ async fn engine_roots(
 ) -> Result<Json<Vec<EngineRoot>>, ApiResponse> {
     require_auth(&state, &headers)?;
     Ok(Json(state.engine_admin.roots()))
+}
+
+async fn opening_books(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<OpeningBookAsset>>, ApiResponse> {
+    require_auth(&state, &headers)?;
+    state
+        .engine_admin
+        .opening_books()
+        .await
+        .map(Json)
+        .map_err(engine_admin_failure)
 }
 
 async fn browse_engines(
@@ -947,7 +962,16 @@ async fn execute(server: &ServerState, command: RunnerCommand) -> Result<Value, 
             Ok(Value::Null)
         }
         RunnerCommand::ConfigureOpeningBook { mut request } => {
-            request.path = server.engine_admin.validate_opening_book(&request.path)?;
+            let current_managed_path = core
+                .snapshot()
+                .await
+                .engines
+                .into_iter()
+                .find(|engine| engine.id == request.engine_id)
+                .and_then(|engine| engine.opening_book.map(|book| book.path));
+            request.path = server
+                .engine_admin
+                .validate_opening_book(&request.path, current_managed_path.as_deref())?;
             value(queen_core::configure_opening_book(request, state()).await?)
         }
         RunnerCommand::ClearEngineOpeningBook { engine_id } => {
@@ -1209,7 +1233,7 @@ mod tests {
     use crate::persistence::{IdempotencyBinding, Reservation, RunnerDatabase};
     use axum::{
         body::{to_bytes, Body, Bytes},
-        http::{Request, StatusCode},
+        http::{header::AUTHORIZATION, Request, StatusCode},
     };
     use futures_util::stream;
     use queen_core::{
@@ -1217,7 +1241,7 @@ mod tests {
         storage::{FileSecretStore, SecretStore},
         AppState,
     };
-    use queen_protocol::{PendingResponse, RunnerCommand, PROTOCOL_VERSION};
+    use queen_protocol::{OpeningBookAsset, PendingResponse, RunnerCommand, PROTOCOL_VERSION};
     #[cfg(not(windows))]
     use std::time::Instant;
     use std::{
@@ -1303,6 +1327,62 @@ mod tests {
             },
         };
         assert!(validate_runner_command(&oversized).is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticated_opening_book_endpoint_lists_only_admin_assets() {
+        let root = std::env::temp_dir().join(format!("queenui-opening-assets-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let book = root.join("approved.bin");
+        std::fs::write(&book, [0_u8; 16]).unwrap();
+        std::fs::write(
+            root.join("runner-config.json"),
+            serde_json::json!({"opening_book_allowlist": [book.clone()]}).to_string(),
+        )
+        .unwrap();
+        let core = AppState::new_with_secret_store(
+            root.clone(),
+            AppConfig::default(),
+            Arc::new(FileSecretStore::new(root.join("secrets"))),
+        )
+        .unwrap();
+        let database = RunnerDatabase::open(root.clone(), [8; 32]).unwrap();
+        let enrollment = database.mint_enrollment(false, 100).unwrap();
+        let bearer = database.redeem(&enrollment.code, 101).unwrap().bearer;
+        let state = ServerState::new(core, database, EngineAdmin::load(&root).unwrap());
+
+        let unauthenticated = router(state.clone())
+            .oneshot(
+                Request::get("/v2/opening-books")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated = router(state.clone())
+            .oneshot(
+                Request::get("/v2/opening-books")
+                    .header(AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated.status(), StatusCode::OK);
+        let body = to_bytes(authenticated.into_body(), 4096).await.unwrap();
+        let assets: Vec<OpeningBookAsset> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].name, "approved.bin");
+        assert_eq!(assets[0].size, 16);
+        assert_eq!(
+            assets[0].path,
+            book.canonicalize().unwrap().to_string_lossy()
+        );
+
+        state.shutdown_forwarder().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

@@ -1,14 +1,17 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { BookOpen, SlidersHorizontal, Trash2, Upload } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
+import * as commands from "../api/commands";
 import type { BusyKeys } from "../hooks/useActionRunner";
 import type { ShowNotice } from "../hooks/useNotices";
+import { formatBytes } from "../lib/format";
 import { pickPath } from "../lib/fileDialog";
 import {
   assertNever,
   uciControlKind,
   type EngineProfile,
   type OpeningBookRequest,
+  type OpeningBookAsset,
   type UciOption,
   type EngineOptionUpdate,
 } from "../types";
@@ -68,6 +71,11 @@ export function EngineConfigurationDialog({
     [options, optionEdits],
   );
   const [bookEdits, setBookEdits] = useState<BookEdits>({});
+  const [remoteBookAssets, setRemoteBookAssets] = useState<OpeningBookAsset[]>(
+    [],
+  );
+  const [loadingRemoteBooks, setLoadingRemoteBooks] = useState(remoteRunner);
+  const [remoteBookError, setRemoteBookError] = useState<string | null>(null);
   const savedBook = engine.openingBook ?? null;
   const bookPath = bookEdits.path ?? savedBook?.path ?? "";
   const bookEnabled = bookEdits.enabled ?? savedBook?.enabled ?? true;
@@ -88,6 +96,28 @@ export function EngineConfigurationDialog({
   const [confirmingDiscard, setConfirmingDiscard] = useState(false);
   const [confirmingRemoveBook, setConfirmingRemoveBook] = useState(false);
   const [confirmingReset, setConfirmingReset] = useState(false);
+
+  useEffect(() => {
+    if (!remoteRunner) return;
+    let active = true;
+    void commands
+      .listOpeningBookAssets()
+      .then((assets) => {
+        if (active) setRemoteBookAssets(assets);
+      })
+      .catch((cause) => {
+        if (!active) return;
+        setRemoteBookError(
+          cause instanceof Error ? cause.message : String(cause),
+        );
+      })
+      .finally(() => {
+        if (active) setLoadingRemoteBooks(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [remoteRunner]);
 
   /*
    * Every confirmation this dialog can raise. Each is its own Radix layer, so
@@ -254,14 +284,57 @@ export function EngineConfigurationDialog({
                     {bookPath && <code title={bookPath}>{bookPath}</code>}
                   </div>
                   {remoteRunner ? (
-                    <input
-                      aria-label="Opening book path on runner"
-                      value={bookPath}
-                      placeholder="/home/user/books/openings.bin"
-                      onChange={(event) =>
-                        setBookEdit("path", event.target.value)
-                      }
-                    />
+                    <div className="runner-book-source">
+                      {remoteBookError ? (
+                        <input
+                          aria-label="Opening book path on runner"
+                          value={bookPath}
+                          placeholder="/home/user/books/openings.bin"
+                          onChange={(event) =>
+                            setBookEdit("path", event.target.value)
+                          }
+                        />
+                      ) : (
+                        <select
+                          aria-label="Approved opening book on runner"
+                          value={bookPath}
+                          disabled={loadingRemoteBooks}
+                          onChange={(event) =>
+                            setBookEdit("path", event.target.value)
+                          }
+                        >
+                          <option value="">
+                            {loadingRemoteBooks
+                              ? "Loading approved books…"
+                              : "Select an approved book"}
+                          </option>
+                          {savedBook &&
+                            !remoteBookAssets.some(
+                              (asset) => asset.path === savedBook.path,
+                            ) && (
+                              <option value={savedBook.path}>
+                                {savedBook.name} · current managed copy
+                              </option>
+                            )}
+                          {remoteBookAssets.map((asset) => (
+                            <option value={asset.path} key={asset.path}>
+                              {asset.name} · {formatBytes(asset.size)}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      <small
+                        className={remoteBookError ? "runner-book-error" : ""}
+                      >
+                        {remoteBookError
+                          ? `${remoteBookError}. Exact-path entry remains available as a compatibility fallback.`
+                          : loadingRemoteBooks
+                            ? "Reading the runner administrator’s approved assets…"
+                            : remoteBookAssets.length === 0 && !savedBook
+                              ? "No opening books are approved in the runner configuration."
+                              : "Only assets approved by the runner administrator are shown."}
+                      </small>
+                    </div>
                   ) : (
                     <Button
                       variant="secondary"

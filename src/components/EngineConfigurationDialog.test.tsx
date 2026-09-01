@@ -1,10 +1,12 @@
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EngineConfigurationDialog } from "./EngineConfigurationDialog";
 import type { EngineProfile } from "../types";
+import * as commands from "../api/commands";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
+vi.mock("../api/commands", () => ({ listOpeningBookAssets: vi.fn() }));
 
 const engine: EngineProfile = {
   id: "engine-1",
@@ -48,6 +50,7 @@ const engine: EngineProfile = {
 function props() {
   return {
     engine,
+    remoteRunner: false,
     busy: new Set<string>(),
     onClose: vi.fn(),
     onSaveOptions: vi.fn(() => Promise.resolve(true)),
@@ -64,7 +67,14 @@ function renderDialog(overrides: Partial<ReturnType<typeof props>> = {}) {
   return merged;
 }
 
-afterEach(cleanup);
+beforeEach(() => {
+  vi.mocked(commands.listOpeningBookAssets).mockResolvedValue([]);
+});
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
 
 describe("engine configuration dialog", () => {
   it("closes straight away when nothing has been edited", async () => {
@@ -254,5 +264,57 @@ describe("engine configuration dialog", () => {
       screen.getByText("Enter how deep the book may be used"),
     ).toBeInTheDocument();
     expect(screen.queryByText(/ply 0/)).not.toBeInTheDocument();
+  });
+
+  it("selects a remote book from the runner-approved assets", async () => {
+    vi.mocked(commands.listOpeningBookAssets).mockResolvedValue([
+      {
+        name: "Cerebellum.bin",
+        path: "/srv/queen/books/Cerebellum.bin",
+        size: 177_973_984,
+      },
+    ]);
+    const user = userEvent.setup();
+    const { onSaveBook } = renderDialog({
+      engine: {
+        ...engine,
+        path: "/srv/queen/engines/zigqueen",
+        openingBook: null,
+      },
+      remoteRunner: true,
+    });
+
+    const selector = await screen.findByRole("combobox", {
+      name: "Approved opening book on runner",
+    });
+    await user.selectOptions(selector, "/srv/queen/books/Cerebellum.bin");
+    await user.click(screen.getByRole("button", { name: "Save book policy" }));
+
+    expect(onSaveBook).toHaveBeenCalledWith(
+      expect.objectContaining({ id: engine.id }),
+      {
+        path: "/srv/queen/books/Cerebellum.bin",
+        enabled: true,
+        maxPlies: 20,
+        topMovePercent: 10,
+      },
+    );
+    expect(screen.queryByLabelText("Opening book path on runner")).toBeNull();
+  });
+
+  it("keeps a runner-managed current book selectable for policy edits", async () => {
+    const user = userEvent.setup();
+    const { onSaveBook } = renderDialog({ remoteRunner: true });
+
+    const selector = await screen.findByRole("combobox", {
+      name: "Approved opening book on runner",
+    });
+    expect(selector).toHaveValue(engine.openingBook?.path);
+    await user.click(screen.getByRole("button", { name: "Save book policy" }));
+
+    expect(onSaveBook).toHaveBeenCalledWith(
+      engine,
+      expect.objectContaining({ path: engine.openingBook?.path }),
+    );
   });
 });

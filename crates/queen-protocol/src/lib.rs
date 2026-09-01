@@ -21,6 +21,10 @@ pub const CAMPAIGN_SCHEDULING_FEATURE: &str = "campaign-scheduling-v1";
 /// A game-limited campaign counts terminal non-aborted games and reserves its
 /// remaining quota across active games and pending challenges.
 pub const CAMPAIGN_COMPLETED_GAME_LIMIT_FEATURE: &str = "campaign-completed-game-limit-v1";
+/// The runner exposes its administrator-approved opening-book assets so the
+/// desktop can offer a bounded selector instead of asking operators to type an
+/// exact path in a remote filesystem.
+pub const OPENING_BOOK_ASSETS_FEATURE: &str = "opening-book-assets-v1";
 pub const CONTENT_SHA256_HEADER: &str = "x-queenui-content-sha256";
 pub const REQUEST_ID_HEADER: &str = "x-queenui-request-id";
 pub const IDEMPOTENCY_TTL_SECONDS: i64 = 24 * 60 * 60;
@@ -36,6 +40,16 @@ pub struct EngineRoot {
     /// crosses the runner protocol.
     pub id: String,
     pub label: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct OpeningBookAsset {
+    /// Canonical runner-local path. Only entries from the administrator's
+    /// opening-book allowlist are exposed here.
+    pub path: String,
+    pub name: String,
+    pub size: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ts_rs::TS)]
