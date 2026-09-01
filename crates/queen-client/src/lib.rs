@@ -4,7 +4,7 @@ use queen_protocol::{
     command_body_digest, CommandRequest, CommandResponse, EngineBrowseRequest,
     EngineBrowseResponse, EngineRoot, EventEnvelope, HandoverInventory, PairRedeemRequest,
     PairRedeemResponse, RunnerCapabilities, RunnerCommand, RunnerIdentity, SnapshotResponse,
-    CONTENT_SHA256_HEADER, PAIRING_PAYLOAD_VERSION, PROTOCOL_VERSION,
+    CAMPAIGN_SCHEDULING_FEATURE, CONTENT_SHA256_HEADER, PAIRING_PAYLOAD_VERSION, PROTOCOL_VERSION,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use rustls::{
@@ -138,6 +138,19 @@ impl RunnerClient {
     }
 
     pub async fn command<T: DeserializeOwned>(&self, command: RunnerCommand) -> Result<T, String> {
+        if let Some(required_feature) = command_required_feature(&command) {
+            let capabilities = self.capabilities().await?;
+            if !capabilities
+                .features
+                .iter()
+                .any(|feature| feature == required_feature)
+            {
+                return Err(
+                    "Upgrade the paired runner before using incoming challenge acceptance or automatic campaign limits; existing runner features remain available"
+                        .into(),
+                );
+            }
+        }
         let request_id = Uuid::new_v4();
         let request = CommandRequest {
             request_id,
@@ -292,6 +305,19 @@ impl RunnerClient {
         url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
             .map_err(|_| "Could not select the runner WebSocket scheme".to_string())?;
         Ok(url)
+    }
+}
+
+fn command_required_feature(command: &RunnerCommand) -> Option<&'static str> {
+    match command {
+        RunnerCommand::StartCampaign { settings }
+            if settings.accept_incoming_challenges
+                || settings.stop_after_minutes.is_some()
+                || settings.stop_after_games.is_some() =>
+        {
+            Some(CAMPAIGN_SCHEDULING_FEATURE)
+        }
+        _ => None,
     }
 }
 
@@ -588,8 +614,13 @@ impl RunnerEventStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_hex, redeem_pairing_payload, PairingPayload, RunnerClient};
-    use queen_protocol::{RunnerIdentity, PAIRING_PAYLOAD_VERSION};
+    use super::{
+        command_required_feature, encode_hex, redeem_pairing_payload, PairingPayload, RunnerClient,
+    };
+    use queen_core::models::CampaignSettings;
+    use queen_protocol::{
+        RunnerCommand, RunnerIdentity, CAMPAIGN_SCHEDULING_FEATURE, PAIRING_PAYLOAD_VERSION,
+    };
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use rustls::{pki_types::PrivateKeyDer, ServerConfig};
     use sha2::{Digest, Sha256};
@@ -642,6 +673,24 @@ mod tests {
                 "accepted {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn only_additive_campaign_controls_require_the_new_runner_feature() {
+        let legacy = RunnerCommand::StartCampaign {
+            settings: CampaignSettings::default(),
+        };
+        assert_eq!(command_required_feature(&legacy), None);
+
+        let settings = CampaignSettings {
+            accept_incoming_challenges: true,
+            ..CampaignSettings::default()
+        };
+        let incoming = RunnerCommand::StartCampaign { settings };
+        assert_eq!(
+            command_required_feature(&incoming),
+            Some(CAMPAIGN_SCHEDULING_FEATURE)
+        );
     }
 
     #[tokio::test]

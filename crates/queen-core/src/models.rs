@@ -229,11 +229,13 @@ pub struct CampaignRuntime {
     pub eligible_bots: u32,
     pub online_bots_scanned: u32,
     pub challenges_sent: u64,
+    #[serde(default)]
     pub games_started: u64,
     pub last_opponent: Option<String>,
     pub activity: String,
     pub error: Option<String>,
     pub next_scan_at: Option<u64>,
+    #[serde(default)]
     pub stop_at: Option<u64>,
     pub events: Vec<CampaignEvent>,
 }

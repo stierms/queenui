@@ -426,7 +426,7 @@ mod tests {
         save_uncertain_challenge_creations, uncertain_challenge_creations_path, ActiveGameIntent,
         DataDirLock, FileSecretStore, SecretStore, UncertainChallengeCreation,
     };
-    use crate::models::{AppConfig, CampaignSettings, EngineProfile};
+    use crate::models::{AppConfig, CampaignRuntime, CampaignSettings, EngineProfile};
 
     #[test]
     fn engine_probe_truth_survives_a_config_round_trip() {
@@ -519,6 +519,28 @@ mod tests {
 
         assert!(loaded.campaigns[0].rated);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn campaign_runtime_from_an_older_runner_defaults_additive_fields() {
+        let runtime: CampaignRuntime = serde_json::from_value(serde_json::json!({
+            "accountId": "bot",
+            "status": "running",
+            "activeGames": 1,
+            "pendingChallenges": 0,
+            "eligibleBots": 4,
+            "onlineBotsScanned": 20,
+            "challengesSent": 7,
+            "lastOpponent": "Opponent",
+            "activity": "At capacity",
+            "error": null,
+            "nextScanAt": null,
+            "events": []
+        }))
+        .expect("deserialize a protocol-v2 campaign runtime");
+
+        assert_eq!(runtime.games_started, 0);
+        assert_eq!(runtime.stop_at, None);
     }
 
     #[test]

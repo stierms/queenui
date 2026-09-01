@@ -12,10 +12,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-// Campaign scheduling and incoming-challenge acceptance add command semantics
-// that an older runner would silently ignore as unknown JSON fields. Require a
-// matching runner instead of presenting controls that are not enforced.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 2;
+/// Additive capability advertised by runners that enforce the campaign fields
+/// introduced after the v2 wire contract shipped. Keeping this separate from
+/// the protocol version lets a newer desktop retain all existing functionality
+/// with a previously paired runner while refusing only unsupported settings.
+pub const CAMPAIGN_SCHEDULING_FEATURE: &str = "campaign-scheduling-v1";
 pub const CONTENT_SHA256_HEADER: &str = "x-queenui-content-sha256";
 pub const REQUEST_ID_HEADER: &str = "x-queenui-request-id";
 pub const IDEMPOTENCY_TTL_SECONDS: i64 = 24 * 60 * 60;
@@ -125,6 +127,8 @@ pub struct RunnerCapabilities {
     pub operating_system: String,
     pub architecture: String,
     pub logical_cpus: usize,
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -313,7 +317,7 @@ pub struct EventEnvelope {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_body_digest, HandoverInventory, RunnerCommand};
+    use super::{command_body_digest, HandoverInventory, RunnerCapabilities, RunnerCommand};
 
     #[test]
     fn command_digest_binds_the_exact_serialized_bytes() {
@@ -362,5 +366,20 @@ mod tests {
                 "payload": { "gameId": "failed-game" }
             })
         );
+    }
+
+    #[test]
+    fn older_runner_capabilities_default_to_no_additive_features() {
+        let capabilities: RunnerCapabilities = serde_json::from_value(serde_json::json!({
+            "protocolVersion": 2,
+            "instanceId": uuid::Uuid::nil(),
+            "hostname": "runner",
+            "operatingSystem": "linux",
+            "architecture": "x86_64",
+            "logicalCpus": 8
+        }))
+        .unwrap();
+
+        assert!(capabilities.features.is_empty());
     }
 }

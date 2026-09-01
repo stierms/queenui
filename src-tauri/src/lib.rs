@@ -2483,6 +2483,7 @@ mod tests {
             operating_system: "test".into(),
             architecture: "test".into(),
             logical_cpus: 1,
+            features: Vec::new(),
         })
         .into_response()
     }

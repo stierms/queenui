@@ -22,8 +22,8 @@ use queen_protocol::{
     command_body_digest, CommandRequest, CommandResponse, EngineBrowseRequest,
     EngineBrowseResponse, EngineRoot, EventEnvelope, HandoverInventory, HealthResponse,
     PairRedeemRequest, PairRedeemResponse, PendingResponse, RunnerCapabilities, RunnerCommand,
-    SnapshotResponse, CONTENT_SHA256_HEADER, IDEMPOTENCY_PENDING_WAIT_SECONDS,
-    PAIRING_PAYLOAD_VERSION, PROTOCOL_VERSION,
+    SnapshotResponse, CAMPAIGN_SCHEDULING_FEATURE, CONTENT_SHA256_HEADER,
+    IDEMPOTENCY_PENDING_WAIT_SECONDS, PAIRING_PAYLOAD_VERSION, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use std::{
@@ -444,6 +444,7 @@ async fn capabilities(
         operating_system: env::consts::OS.into(),
         architecture: env::consts::ARCH.into(),
         logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
+        features: vec![CAMPAIGN_SCHEDULING_FEATURE.into()],
     }))
 }
 
