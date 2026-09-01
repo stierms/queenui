@@ -700,18 +700,29 @@ impl AppState {
         let runtimes = self.0.runtimes.read().await;
         let games = self.0.games.read().await;
         let campaign_runtimes = self.0.campaign_runtimes.read().await;
+        let active_intents = self.0.active_intents.lock().await;
         let mut runtimes: Vec<_> = runtimes.values().cloned().collect();
         let mut games: Vec<_> = games.values().cloned().collect();
         let mut campaign_runtimes: Vec<_> = campaign_runtimes.values().cloned().collect();
         runtimes.sort_by(|left, right| left.account_id.cmp(&right.account_id));
         games.sort_by(|left, right| left.id.cmp(&right.id));
         campaign_runtimes.sort_by(|left, right| left.account_id.cmp(&right.account_id));
-        // Every state change rebuilds the snapshot, so this is the one place
-        // that always knows how many games are in progress.
-        self.0.live_games.store(
-            games.iter().filter(|game| is_live(game)).count(),
-            Ordering::Relaxed,
+        // An accepted incoming challenge is a durable game intent before its
+        // gameStart event arrives. Count the union so the close guard cannot
+        // miss that short but ownership-critical transition.
+        let mut live_ownership: HashSet<GameKey> = games
+            .iter()
+            .filter(|game| is_live(game))
+            .map(|game| (game.account_id.clone(), game.id.clone()))
+            .collect();
+        live_ownership.extend(
+            active_intents
+                .iter()
+                .map(|intent| (intent.account_id.clone(), intent.game_id.clone())),
         );
+        self.0
+            .live_games
+            .store(live_ownership.len(), Ordering::Relaxed);
         AppSnapshot {
             engines: config.engines.clone(),
             accounts: config.accounts.clone(),
@@ -1752,26 +1763,38 @@ impl AppState {
         Ok(())
     }
 
-    async fn add_active_intent(&self, account_id: &str, game_id: &str) -> Result<(), String> {
+    pub(crate) async fn add_active_intent(
+        &self,
+        account_id: &str,
+        game_id: &str,
+    ) -> Result<(), String> {
         let mut intents = self.0.active_intents.lock().await;
         let mut next = intents.clone();
-        next.insert(storage::ActiveGameIntent {
+        if !next.insert(storage::ActiveGameIntent {
             account_id: account_id.to_string(),
             game_id: game_id.to_string(),
-        });
+        }) {
+            return Ok(());
+        }
         let values: Vec<_> = next.iter().cloned().collect();
         persist_intents(self.0.active_intents_path.clone(), values).await?;
         *intents = next;
         Ok(())
     }
 
-    async fn remove_active_intent(&self, account_id: &str, game_id: &str) -> Result<(), String> {
+    pub(crate) async fn remove_active_intent(
+        &self,
+        account_id: &str,
+        game_id: &str,
+    ) -> Result<(), String> {
         let mut intents = self.0.active_intents.lock().await;
         let mut next = intents.clone();
-        next.remove(&storage::ActiveGameIntent {
+        if !next.remove(&storage::ActiveGameIntent {
             account_id: account_id.to_string(),
             game_id: game_id.to_string(),
-        });
+        }) {
+            return Ok(());
+        }
         let values: Vec<_> = next.iter().cloned().collect();
         persist_intents(self.0.active_intents_path.clone(), values).await?;
         *intents = next;
@@ -1836,6 +1859,20 @@ impl AppState {
         &self,
     ) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, String> {
         const ERROR: &str = "QueenUI is changing runners; the outgoing challenge was not created";
+        if self.0.quiescing.load(Ordering::Acquire) {
+            return Err(ERROR.into());
+        }
+        let admission = self.0.ownership_admission.read().await;
+        if self.0.quiescing.load(Ordering::Acquire) {
+            return Err(ERROR.into());
+        }
+        Ok(admission)
+    }
+
+    pub(crate) async fn incoming_challenge_admission(
+        &self,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, String> {
+        const ERROR: &str = "QueenUI is changing runners; the incoming challenge was not accepted";
         if self.0.quiescing.load(Ordering::Acquire) {
             return Err(ERROR.into());
         }
@@ -3101,7 +3138,7 @@ async fn handle_account_event(
         .unwrap_or_default();
     if matches!(
         event_type,
-        "challengeDeclined" | "challengeCanceled" | "gameStart" | "gameFinish"
+        "challengeDeclined" | "challengeCanceled" | "gameFinish"
     ) {
         let resolved_challenge_id =
             if event_type == "challengeDeclined" || event_type == "challengeCanceled" {
@@ -3133,6 +3170,11 @@ async fn handle_account_event(
                         resolved_opponent,
                     )
                     .await;
+                if event_type == "challengeCanceled" {
+                    state
+                        .remove_active_intent(&account.id, challenge_id)
+                        .await?;
+                }
             }
         }
         campaign::record_account_event(state, &account.id, event_type, &event).await;
@@ -3144,8 +3186,7 @@ async fn handle_account_event(
         return Ok(());
     }
     if event_type == "challenge" {
-        decline_incoming_challenge(state, account, token, &event).await;
-        return Ok(());
+        return campaign::handle_incoming_challenge(state, account, token, &event).await;
     }
     if event_type != "gameStart" {
         return Ok(());
@@ -3156,6 +3197,12 @@ async fn handle_account_event(
         .and_then(Value::as_str)
         .ok_or_else(|| "Lichess sent a game start without a game id".to_string())?
         .to_string();
+    let already_active = state
+        .0
+        .active_games
+        .lock()
+        .await
+        .contains(&(account.id.clone(), game_id.clone()));
     let result = state
         .spawn_game_task(
             account.clone(),
@@ -3167,6 +3214,9 @@ async fn handle_account_event(
         )
         .await;
     if result.is_ok() {
+        if !already_active {
+            campaign::record_account_event(state, &account.id, event_type, &event).await;
+        }
         let opponent = event
             .pointer("/game/opponent/username")
             .or_else(|| event.pointer("/game/opponent/id"))
@@ -3176,44 +3226,6 @@ async fn handle_account_event(
             .await;
     }
     result
-}
-
-/// QueenUI only plays games it initiated, so incoming challenges are declined
-/// explicitly instead of being left to expire on the challenger's side.
-async fn decline_incoming_challenge(
-    state: &AppState,
-    account: &AccountProfile,
-    token: &str,
-    event: &Value,
-) {
-    let Some(challenge_id) = event.pointer("/challenge/id").and_then(Value::as_str) else {
-        return;
-    };
-    let challenger = event
-        .pointer("/challenge/challenger/id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    // Our own outgoing challenges are also echoed on the event stream; never
-    // decline those.
-    if challenger.eq_ignore_ascii_case(&account.id)
-        || challenger.eq_ignore_ascii_case(&account.username)
-    {
-        return;
-    }
-    if let Err(error) = lichess::decline_challenge(
-        &state.0.api_base,
-        &state.0.api_client,
-        token,
-        challenge_id,
-        "generic",
-    )
-    .await
-    {
-        diagnostics::record(
-            DiagnosticEntry::warn("lichess", "Could not decline an incoming challenge")
-                .with_detail(format!("challenge {challenge_id}: {error}")),
-        );
-    }
 }
 
 /// Records one game's complete UCI conversation while it is played.
@@ -5816,6 +5828,9 @@ mod owned_lifecycle_acceptance_tests {
             clock_increment: 2,
             rated: true,
             color: "random".into(),
+            accept_incoming_challenges: true,
+            stop_after_minutes: Some(90),
+            stop_after_games: None,
         });
         let secrets = Arc::new(FileSecretStore::new(root.join("secrets")));
         secrets.store("bot", "old-token").unwrap();
@@ -8136,6 +8151,9 @@ mod state_maintenance_tests {
             clock_increment: 3,
             rated: true,
             color: "black".into(),
+            accept_incoming_challenges: true,
+            stop_after_minutes: None,
+            stop_after_games: Some(25),
         });
         storage::save(&storage::config_path(&root), &config).unwrap();
 

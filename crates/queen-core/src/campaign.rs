@@ -2,8 +2,8 @@ use crate::{
     history::perf_key_for_clock,
     lichess,
     models::{
-        CampaignEvent, CampaignRuntime, CampaignSettings, CampaignStatus, ChallengeRequest,
-        OnlineBot,
+        AccountProfile, CampaignEvent, CampaignRuntime, CampaignSettings, CampaignStatus,
+        ChallengeRequest, OnlineBot,
     },
     storage, AppState,
 };
@@ -26,6 +26,8 @@ const CHALLENGE_SPACING: Duration = Duration::from_secs(2);
 const MAX_CONCURRENCY: u32 = 8;
 const MAX_ACTIVITY_EVENTS: usize = 60;
 const CAMPAIGN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RUN_MINUTES: u32 = 7 * 24 * 60;
+const MAX_RUN_GAMES: u32 = 10_000;
 
 struct PendingChallenge {
     opponent: String,
@@ -52,6 +54,25 @@ struct FilterStats {
     provisional_or_unplayed: u32,
     outside_range: u32,
     busy_or_cooling_down: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CampaignCapacity {
+    occupied_slots: u32,
+    committed_not_started: u32,
+    games_started: u64,
+}
+
+#[derive(Debug)]
+struct IncomingChallenge {
+    id: String,
+    opponent: String,
+}
+
+#[derive(Debug)]
+struct IncomingRejection {
+    lichess_reason: &'static str,
+    detail: String,
 }
 
 pub(super) async fn start(state: AppState, settings: CampaignSettings) -> Result<(), String> {
@@ -144,6 +165,10 @@ pub(super) async fn start(state: AppState, settings: CampaignSettings) -> Result
             return Err(error);
         }
     };
+    let started_at = epoch_millis();
+    let stop_at = settings.stop_after_minutes.map(|minutes| {
+        started_at.saturating_add(Duration::from_secs(u64::from(minutes) * 60).as_millis() as u64)
+    });
     state.0.campaign_runtimes.write().await.insert(
         settings.account_id.clone(),
         CampaignRuntime {
@@ -154,21 +179,29 @@ pub(super) async fn start(state: AppState, settings: CampaignSettings) -> Result
             eligible_bots: 0,
             online_bots_scanned: 0,
             challenges_sent: 0,
+            games_started: 0,
             last_opponent: None,
             activity: "Connecting matchmaking…".into(),
             error: None,
             next_scan_at: None,
+            stop_at,
             events: vec![new_event(
                 "start",
                 "Matchmaking started",
                 Some(format!(
-                    "Rating {}–{} · concurrency {} · {}+{} · {}",
+                    "Rating {}–{} · concurrency {} · {}+{} · {} · {} · {}",
                     settings.min_rating,
                     settings.max_rating,
                     settings.concurrency,
                     settings.clock_limit / 60,
                     settings.clock_increment,
-                    if settings.rated { "rated" } else { "casual" }
+                    if settings.rated { "rated" } else { "casual" },
+                    if settings.accept_incoming_challenges {
+                        "incoming challenges enabled"
+                    } else {
+                        "outgoing only"
+                    },
+                    campaign_limit_label(&settings)
                 )),
             )],
         },
@@ -337,11 +370,40 @@ async fn run_with_pending_lifetime(
     let mut challenges_sent = 0u64;
     let mut next_cancellation_reconciliation = Instant::now();
     let perf = perf_key_for_clock(settings.clock_limit, settings.clock_increment);
+    let deadline = settings
+        .stop_after_minutes
+        .map(|minutes| Instant::now() + Duration::from_secs(u64::from(minutes) * 60));
+    let mut automatic_stop_reason: Option<String> = None;
     // Campaign startup and every ambiguous POST pass through the same
     // authoritative reconciliation barrier before any new challenge creation.
     let mut unknown_creation = Some("startup reconciliation".to_string());
 
     'campaign: while !cancellation.is_cancelled() {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            automatic_stop_reason = Some(format!(
+                "The configured {} minute run time elapsed",
+                settings.stop_after_minutes.unwrap_or_default()
+            ));
+            break;
+        }
+        let capacity = campaign_capacity(&state, &settings.account_id).await;
+        if settings
+            .stop_after_games
+            .is_some_and(|limit| capacity.games_started >= u64::from(limit))
+        {
+            automatic_stop_reason = Some(format!(
+                "The configured {} game limit was reached",
+                settings.stop_after_games.unwrap_or_default()
+            ));
+            break;
+        }
+        if let Some(backoff_until) = campaign_backoff_until(&state, &settings.account_id).await {
+            let remaining_ms = backoff_until.saturating_sub(epoch_millis()).min(1_000);
+            if wait_or_cancel(&cancellation, Duration::from_millis(remaining_ms.max(1))).await {
+                break;
+            }
+            continue;
+        }
         if unknown_creation.is_none() {
             unknown_creation = state
                 .0
@@ -541,8 +603,8 @@ async fn run_with_pending_lifetime(
         }
 
         let active_games = active_game_count(&state, &settings.account_id).await;
-        let occupied = active_games.saturating_add(pending.len() as u32);
-        let available_slots = settings.concurrency.saturating_sub(occupied);
+        let capacity = campaign_capacity(&state, &settings.account_id).await;
+        let available_slots = available_admissions(&settings, capacity);
         let cancellation_warning = pending_cancellation_warning(&pending);
 
         update_runtime(&state, &settings.account_id, |runtime| {
@@ -560,11 +622,20 @@ async fn run_with_pending_lifetime(
             } else if available_slots == 0 {
                 runtime.status = CampaignStatus::Running;
                 runtime.next_scan_at = None;
-                runtime.activity = format!(
-                    "At capacity: {} game(s), {} pending",
-                    active_games,
-                    pending.len()
-                );
+                runtime.activity = if settings.stop_after_games.is_some_and(|limit| {
+                    capacity
+                        .games_started
+                        .saturating_add(u64::from(capacity.committed_not_started))
+                        >= u64::from(limit)
+                }) {
+                    "Game quota committed; waiting for pending games to start".into()
+                } else {
+                    format!(
+                        "At capacity: {} game(s), {} pending",
+                        active_games,
+                        pending.len()
+                    )
+                };
             }
         })
         .await;
@@ -714,6 +785,13 @@ async fn run_with_pending_lifetime(
                                 Err(_) => break 'campaign,
                             };
                             let _gate = state.0.matchmaking_api_gate.lock().await;
+                            if available_admissions(
+                                &settings,
+                                campaign_capacity(&state, &settings.account_id).await,
+                            ) == 0
+                            {
+                                break;
+                            }
                             let external_unknown = state
                                 .0
                                 .uncertain_challenge_creations
@@ -1117,6 +1195,8 @@ async fn run_with_pending_lifetime(
         runtime.pending_challenges = pending.len() as u32 + u32::from(unknown_creation.is_some());
         runtime.activity = if stop_error.is_some() {
             "Stopped, but challenge cancellation is unresolved".into()
+        } else if let Some(reason) = automatic_stop_reason.as_ref() {
+            format!("{reason}; active games will finish normally")
         } else {
             "Stopped; active games will finish normally".into()
         };
@@ -1132,11 +1212,15 @@ async fn run_with_pending_lifetime(
                 },
                 if stop_error.is_some() {
                     "Matchmaking stopped with unresolved challenges"
+                } else if automatic_stop_reason.is_some() {
+                    "Automatic run limit reached"
                 } else {
                     "Matchmaking stopped"
                 },
                 stop_error.clone().or_else(|| {
-                    Some("Outstanding challenges were canceled; active games continue".into())
+                    Some(automatic_stop_reason.clone().unwrap_or_else(|| {
+                        "Outstanding challenges were canceled; active games continue".into()
+                    }))
                 }),
             ),
         );
@@ -1197,6 +1281,102 @@ fn pending_cancellation_warning(pending: &HashMap<String, PendingChallenge>) -> 
             None
         }
     })
+}
+
+fn campaign_limit_label(settings: &CampaignSettings) -> String {
+    if let Some(minutes) = settings.stop_after_minutes {
+        format!(
+            "stop after {minutes} minute{}",
+            if minutes == 1 { "" } else { "s" }
+        )
+    } else if let Some(games) = settings.stop_after_games {
+        format!(
+            "stop after {games} game{}",
+            if games == 1 { "" } else { "s" }
+        )
+    } else {
+        "manual stop".into()
+    }
+}
+
+async fn campaign_capacity(state: &AppState, account_id: &str) -> CampaignCapacity {
+    let active_ids: HashSet<String> = state
+        .0
+        .active_games
+        .lock()
+        .await
+        .iter()
+        .filter(|(game_account, _)| game_account == account_id)
+        .map(|(_, game_id)| game_id.clone())
+        .collect();
+    let known_ids: Vec<String> = state
+        .0
+        .known_outgoing_challenges
+        .lock()
+        .await
+        .keys()
+        .filter(|(challenge_account, _)| challenge_account == account_id)
+        .map(|(_, challenge_id)| challenge_id.clone())
+        .collect();
+    let intent_ids: Vec<String> = state
+        .0
+        .active_intents
+        .lock()
+        .await
+        .iter()
+        .filter(|intent| intent.account_id == account_id)
+        .map(|intent| intent.game_id.clone())
+        .collect();
+
+    let mut occupied = active_ids.clone();
+    let mut committed_not_started = HashSet::new();
+    for challenge_id in known_ids {
+        // The write-ahead outgoing reservation intentionally has no server id
+        // yet. Give it a collision-free local key so it still consumes one
+        // slot and one future-game allowance.
+        let key = if challenge_id.is_empty() {
+            "\0pending-outgoing".to_string()
+        } else {
+            challenge_id
+        };
+        occupied.insert(key.clone());
+        if !active_ids.contains(&key) {
+            committed_not_started.insert(key);
+        }
+    }
+    for game_id in intent_ids {
+        occupied.insert(game_id.clone());
+        if !active_ids.contains(&game_id) {
+            committed_not_started.insert(game_id);
+        }
+    }
+    let games_started = state
+        .0
+        .campaign_runtimes
+        .read()
+        .await
+        .get(account_id)
+        .map(|runtime| runtime.games_started)
+        .unwrap_or_default();
+    CampaignCapacity {
+        occupied_slots: occupied.len().min(u32::MAX as usize) as u32,
+        committed_not_started: committed_not_started.len().min(u32::MAX as usize) as u32,
+        games_started,
+    }
+}
+
+fn available_admissions(settings: &CampaignSettings, capacity: CampaignCapacity) -> u32 {
+    let slots = settings.concurrency.saturating_sub(capacity.occupied_slots);
+    let Some(game_limit) = settings.stop_after_games else {
+        return slots;
+    };
+    let committed = capacity
+        .games_started
+        .saturating_add(u64::from(capacity.committed_not_started));
+    let game_allowance = u64::from(game_limit)
+        .saturating_sub(committed)
+        .min(u64::from(u32::MAX)) as u32;
+    slots.min(game_allowance)
 }
 
 fn filter_candidates(
@@ -1293,6 +1473,501 @@ async fn active_game_count(state: &AppState, account_id: &str) -> u32 {
         .count() as u32
 }
 
+/// Applies the active campaign's rules to one account-stream challenge event.
+/// The durable game intent is written before the accept POST, making an
+/// ambiguous response capacity-consuming and restart-reconcilable just like a
+/// gameStart that arrived during a runner handover.
+pub(super) async fn handle_incoming_challenge(
+    state: &AppState,
+    account: &AccountProfile,
+    token: &str,
+    event: &Value,
+) -> Result<(), String> {
+    let challenger = event
+        .pointer("/challenge/challenger/id")
+        .or_else(|| event.pointer("/challenge/challenger/name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if challenger.eq_ignore_ascii_case(&account.id)
+        || challenger.eq_ignore_ascii_case(&account.username)
+        || event
+            .pointer("/challenge/direction")
+            .and_then(Value::as_str)
+            == Some("out")
+    {
+        // Lichess echoes our own outgoing challenge on this stream.
+        return Ok(());
+    }
+
+    let Some((settings, cancellation, status)) = incoming_campaign(state, &account.id).await else {
+        decline_incoming(state, &account.id, token, event, "generic", None).await;
+        return Ok(());
+    };
+    if matches!(status, CampaignStatus::Backoff | CampaignStatus::Unknown) {
+        // A rate-limit or ambiguous-write pause applies to every matchmaking
+        // write. Leave the challenge untouched instead of violating it with an
+        // accept or decline request; Lichess will expire it normally.
+        return Ok(());
+    }
+    if !settings.accept_incoming_challenges {
+        decline_incoming(state, &account.id, token, event, "generic", None).await;
+        return Ok(());
+    }
+
+    let local_accounts: HashSet<String> = state
+        .0
+        .config
+        .read()
+        .await
+        .accounts
+        .iter()
+        .flat_map(|configured| {
+            [
+                configured.id.to_lowercase(),
+                configured.username.to_lowercase(),
+            ]
+        })
+        .collect();
+    let incoming = match validate_incoming_challenge(event, &settings, &local_accounts) {
+        Ok(incoming) => incoming,
+        Err(rejection) => {
+            decline_incoming(
+                state,
+                &account.id,
+                token,
+                event,
+                rejection.lichess_reason,
+                Some(rejection.detail),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    let _ownership = match state.incoming_challenge_admission().await {
+        Ok(admission) => admission,
+        Err(_) => return Ok(()),
+    };
+    let _gate = state.0.matchmaking_api_gate.lock().await;
+    let Some((current_settings, current_cancellation, current_status)) =
+        incoming_campaign(state, &account.id).await
+    else {
+        drop(_gate);
+        decline_incoming(
+            state,
+            &account.id,
+            token,
+            event,
+            "later",
+            Some("The matchmaking run stopped before this challenge could be accepted".into()),
+        )
+        .await;
+        return Ok(());
+    };
+    if cancellation.is_cancelled()
+        || current_cancellation.is_cancelled()
+        || !current_settings.accept_incoming_challenges
+        || !matches!(
+            current_status,
+            CampaignStatus::Starting
+                | CampaignStatus::Discovering
+                | CampaignStatus::Challenging
+                | CampaignStatus::Running
+                | CampaignStatus::Waiting
+        )
+        || current_settings
+            .stop_after_minutes
+            .zip(
+                state
+                    .0
+                    .campaign_runtimes
+                    .read()
+                    .await
+                    .get(&account.id)
+                    .and_then(|runtime| runtime.stop_at),
+            )
+            .is_some_and(|(_, stop_at)| epoch_millis() >= stop_at)
+        || available_admissions(
+            &current_settings,
+            campaign_capacity(state, &account.id).await,
+        ) == 0
+        || opponent_busy(state, &account.id, &incoming.opponent).await
+    {
+        drop(_gate);
+        decline_incoming(
+            state,
+            &account.id,
+            token,
+            event,
+            "later",
+            Some("No campaign capacity or run allowance remained".into()),
+        )
+        .await;
+        return Ok(());
+    }
+
+    state
+        .add_active_intent(&account.id, &incoming.id)
+        .await
+        .map_err(|error| {
+            format!(
+                "Incoming challenge {} was not accepted because its durable game barrier could not be saved: {error}",
+                incoming.id
+            )
+        })?;
+    match lichess::accept_challenge(&state.0.api_base, &state.0.api_client, token, &incoming.id)
+        .await
+    {
+        Ok(()) => {
+            update_runtime(state, &account.id, |runtime| {
+                runtime.activity =
+                    format!("Accepted an incoming challenge from {}", incoming.opponent);
+                runtime.last_opponent = Some(incoming.opponent.clone());
+                push_event(
+                    runtime,
+                    new_event(
+                        "accepted",
+                        "Incoming challenge accepted",
+                        Some(format!(
+                            "{} now occupies one campaign slot",
+                            incoming.opponent
+                        )),
+                    ),
+                );
+            })
+            .await;
+            state.emit_snapshot().await;
+            Ok(())
+        }
+        Err(error) => {
+            let ambiguous = error.ambiguous_write;
+            let rate_limited = error.is_rate_limited();
+            let retry_after = error.retry_after.unwrap_or(Duration::from_secs(60));
+            let barrier_error = if ambiguous {
+                None
+            } else {
+                state
+                    .remove_active_intent(&account.id, &incoming.id)
+                    .await
+                    .err()
+            };
+            let detail = format!(
+                "{}: {error}{}",
+                incoming.opponent,
+                barrier_error
+                    .as_ref()
+                    .map(|barrier| format!("; the definitive failure was received, but the durable game barrier could not be cleared: {barrier}"))
+                    .unwrap_or_default()
+            );
+            update_runtime(state, &account.id, |runtime| {
+                runtime.activity = if rate_limited {
+                    "Lichess rate limit: incoming acceptance will retry automatically".into()
+                } else if ambiguous || barrier_error.is_some() {
+                    "Incoming challenge outcome is being reconciled".into()
+                } else {
+                    "Incoming challenge could not be accepted".into()
+                };
+                if rate_limited {
+                    runtime.status = CampaignStatus::Backoff;
+                    runtime.error = Some(detail.clone());
+                    runtime.next_scan_at =
+                        Some(epoch_millis().saturating_add(retry_after.as_millis() as u64));
+                } else if ambiguous || barrier_error.is_some() {
+                    runtime.status = CampaignStatus::Unknown;
+                    runtime.error = Some(detail.clone());
+                }
+                push_event(
+                    runtime,
+                    new_event(
+                        if rate_limited {
+                            "backoff"
+                        } else if ambiguous || barrier_error.is_some() {
+                            "unknown"
+                        } else {
+                            "rejected"
+                        },
+                        if rate_limited {
+                            "Incoming challenge acceptance was rate limited"
+                        } else if ambiguous || barrier_error.is_some() {
+                            "Incoming challenge result is unknown"
+                        } else {
+                            "Incoming challenge could not be accepted"
+                        },
+                        Some(detail.clone()),
+                    ),
+                );
+            })
+            .await;
+            state.emit_snapshot().await;
+            crate::diagnostics::record(
+                crate::diagnostics::DiagnosticEntry::warn(
+                    "lichess",
+                    "Could not accept an incoming challenge",
+                )
+                .with_account(&account.id)
+                .with_detail(detail.clone()),
+            );
+            if ambiguous || barrier_error.is_some() {
+                Err(detail)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn incoming_campaign(
+    state: &AppState,
+    account_id: &str,
+) -> Option<(CampaignSettings, CancellationToken, CampaignStatus)> {
+    let cancellation = state
+        .0
+        .campaign_tasks
+        .lock()
+        .await
+        .get(account_id)?
+        .cancellation
+        .clone();
+    if cancellation.is_cancelled() {
+        return None;
+    }
+    let status = state
+        .0
+        .campaign_runtimes
+        .read()
+        .await
+        .get(account_id)?
+        .status;
+    let settings = state
+        .0
+        .config
+        .read()
+        .await
+        .campaigns
+        .iter()
+        .find(|campaign| campaign.account_id == account_id)?
+        .clone();
+    Some((settings, cancellation, status))
+}
+
+async fn campaign_backoff_until(state: &AppState, account_id: &str) -> Option<u64> {
+    state
+        .0
+        .campaign_runtimes
+        .read()
+        .await
+        .get(account_id)
+        .filter(|runtime| runtime.status == CampaignStatus::Backoff)
+        .and_then(|runtime| runtime.next_scan_at)
+        .filter(|backoff_until| *backoff_until > epoch_millis())
+}
+
+fn validate_incoming_challenge(
+    event: &Value,
+    settings: &CampaignSettings,
+    local_accounts: &HashSet<String>,
+) -> Result<IncomingChallenge, IncomingRejection> {
+    let challenge = event.get("challenge").ok_or_else(|| IncomingRejection {
+        lichess_reason: "generic",
+        detail: "Lichess omitted the incoming challenge details".into(),
+    })?;
+    let id = challenge
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| IncomingRejection {
+            lichess_reason: "generic",
+            detail: "Lichess omitted the incoming challenge id".into(),
+        })?;
+    let opponent = challenge
+        .pointer("/challenger/name")
+        .or_else(|| challenge.pointer("/challenger/id"))
+        .and_then(Value::as_str)
+        .filter(|opponent| !opponent.is_empty())
+        .ok_or_else(|| IncomingRejection {
+            lichess_reason: "generic",
+            detail: "Lichess omitted the challenger's identity".into(),
+        })?;
+    if local_accounts.contains(&opponent.to_lowercase()) {
+        return Err(IncomingRejection {
+            lichess_reason: "generic",
+            detail: format!("{opponent} is another QueenUI-managed account"),
+        });
+    }
+    if event.pointer("/compat/bot").and_then(Value::as_bool) != Some(true) {
+        return Err(IncomingRejection {
+            lichess_reason: "noBot",
+            detail: format!("{opponent}'s challenge is not compatible with the Bot API"),
+        });
+    }
+    if challenge.pointer("/variant/key").and_then(Value::as_str) != Some("standard") {
+        return Err(IncomingRejection {
+            lichess_reason: "standard",
+            detail: format!("{opponent} requested a non-standard variant"),
+        });
+    }
+    if challenge
+        .pointer("/timeControl/type")
+        .and_then(Value::as_str)
+        != Some("clock")
+        || challenge
+            .pointer("/timeControl/limit")
+            .and_then(Value::as_u64)
+            != Some(u64::from(settings.clock_limit))
+        || challenge
+            .pointer("/timeControl/increment")
+            .and_then(Value::as_u64)
+            != Some(u64::from(settings.clock_increment))
+    {
+        return Err(IncomingRejection {
+            lichess_reason: "timeControl",
+            detail: format!(
+                "{opponent}'s challenge does not match {}+{}",
+                settings.clock_limit / 60,
+                settings.clock_increment
+            ),
+        });
+    }
+    if challenge.get("rated").and_then(Value::as_bool) != Some(settings.rated) {
+        return Err(IncomingRejection {
+            lichess_reason: if settings.rated { "rated" } else { "casual" },
+            detail: format!(
+                "{opponent}'s challenge does not match the {} campaign mode",
+                if settings.rated { "rated" } else { "casual" }
+            ),
+        });
+    }
+    let rating = challenge
+        .pointer("/challenger/rating")
+        .and_then(Value::as_i64);
+    let provisional = challenge
+        .pointer("/challenger/provisional")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if provisional
+        || rating.is_none_or(|rating| rating < settings.min_rating || rating > settings.max_rating)
+    {
+        return Err(IncomingRejection {
+            lichess_reason: "generic",
+            detail: format!(
+                "{opponent} has no established rating inside {}–{}",
+                settings.min_rating, settings.max_rating
+            ),
+        });
+    }
+    if settings.color != "random" {
+        let bot_color = match challenge.get("finalColor").and_then(Value::as_str) {
+            Some("white") => Some("black"),
+            Some("black") => Some("white"),
+            _ => None,
+        };
+        if bot_color != Some(settings.color.as_str()) {
+            return Err(IncomingRejection {
+                lichess_reason: "generic",
+                detail: format!(
+                    "{opponent}'s challenge does not assign the bot {}",
+                    settings.color
+                ),
+            });
+        }
+    }
+    Ok(IncomingChallenge {
+        id: id.to_string(),
+        opponent: opponent.to_string(),
+    })
+}
+
+async fn opponent_busy(state: &AppState, account_id: &str, opponent: &str) -> bool {
+    let playing = state.0.games.read().await.values().any(|game| {
+        game.account_id == account_id
+            && game.opponent.eq_ignore_ascii_case(opponent)
+            && (game.status == "created" || game.status == "started")
+    });
+    playing
+        || state.0.known_outgoing_challenges.lock().await.iter().any(
+            |((challenge_account, _), known_opponent)| {
+                challenge_account == account_id && known_opponent.eq_ignore_ascii_case(opponent)
+            },
+        )
+}
+
+async fn decline_incoming(
+    state: &AppState,
+    account_id: &str,
+    token: &str,
+    event: &Value,
+    reason: &'static str,
+    campaign_detail: Option<String>,
+) {
+    let Some(challenge_id) = event.pointer("/challenge/id").and_then(Value::as_str) else {
+        return;
+    };
+    let result = {
+        let _gate = state.0.matchmaking_api_gate.lock().await;
+        lichess::decline_challenge(
+            &state.0.api_base,
+            &state.0.api_client,
+            token,
+            challenge_id,
+            reason,
+        )
+        .await
+    };
+    if let Err(error) = result {
+        crate::diagnostics::record(
+            crate::diagnostics::DiagnosticEntry::warn(
+                "lichess",
+                "Could not decline an incoming challenge",
+            )
+            .with_account(account_id)
+            .with_detail(format!("challenge {challenge_id}: {error}")),
+        );
+        if error.is_rate_limited() && state.0.campaign_tasks.lock().await.contains_key(account_id) {
+            let retry_after = error.retry_after.unwrap_or(Duration::from_secs(60));
+            let detail = format!("Incoming challenge decline was rate limited: {error}");
+            update_runtime(state, account_id, |runtime| {
+                runtime.status = CampaignStatus::Backoff;
+                runtime.activity =
+                    "Lichess rate limit: matchmaking will resume automatically".into();
+                runtime.error = Some(detail.clone());
+                runtime.next_scan_at =
+                    Some(epoch_millis().saturating_add(retry_after.as_millis() as u64));
+                push_event(
+                    runtime,
+                    new_event(
+                        "backoff",
+                        "Incoming challenge decline was rate limited",
+                        Some(detail.clone()),
+                    ),
+                );
+            })
+            .await;
+            state.emit_snapshot().await;
+        }
+        if let Some(detail) = campaign_detail {
+            record_event(
+                state,
+                account_id,
+                "error",
+                "Incoming challenge could not be declined",
+                Some(format!("{detail}; Lichess returned: {error}")),
+            )
+            .await;
+        }
+        return;
+    }
+    if let Some(detail) = campaign_detail {
+        record_event(
+            state,
+            account_id,
+            "rejected",
+            "Incoming challenge declined",
+            Some(detail),
+        )
+        .await;
+    }
+}
+
 pub(super) async fn record_account_event(
     state: &AppState,
     account_id: &str,
@@ -1351,17 +2026,26 @@ pub(super) async fn record_account_event(
                 .pointer("/game/opponent/username")
                 .or_else(|| event.pointer("/game/opponent/id"))
                 .and_then(Value::as_str);
-            record_event(
-                state,
-                account_id,
-                "accepted",
-                "Challenge accepted — game started",
-                Some(match opponent {
-                    Some(opponent) => format!("Playing {opponent} · game #{game_id}"),
-                    None => format!("Game #{game_id}"),
-                }),
-            )
+            update_runtime(state, account_id, |runtime| {
+                runtime.games_started = runtime.games_started.saturating_add(1);
+                runtime.activity = match opponent {
+                    Some(opponent) => format!("Game started against {opponent}"),
+                    None => "Game started".into(),
+                };
+                push_event(
+                    runtime,
+                    new_event(
+                        "accepted",
+                        "Challenge accepted — game started",
+                        Some(match opponent {
+                            Some(opponent) => format!("Playing {opponent} · game #{game_id}"),
+                            None => format!("Game #{game_id}"),
+                        }),
+                    ),
+                );
+            })
             .await;
+            state.emit_snapshot().await;
         }
         "gameFinish" => {
             let game_id = event
@@ -1456,6 +2140,25 @@ fn validate(settings: &CampaignSettings) -> Result<(), String> {
     if !matches!(settings.color.as_str(), "white" | "black" | "random") {
         return Err("Challenge color must be white, black, or random.".into());
     }
+    if settings.stop_after_minutes.is_some() && settings.stop_after_games.is_some() {
+        return Err("Choose either a time limit or a game limit, not both.".into());
+    }
+    if settings
+        .stop_after_minutes
+        .is_some_and(|minutes| !(1..=MAX_RUN_MINUTES).contains(&minutes))
+    {
+        return Err(format!(
+            "Campaign duration must be between 1 and {MAX_RUN_MINUTES} minutes."
+        ));
+    }
+    if settings
+        .stop_after_games
+        .is_some_and(|games| !(1..=MAX_RUN_GAMES).contains(&games))
+    {
+        return Err(format!(
+            "Campaign game limit must be between 1 and {MAX_RUN_GAMES}."
+        ));
+    }
     Ok(())
 }
 
@@ -1471,9 +2174,10 @@ pub(super) fn validate_clock(limit: u32, increment: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_candidates, randomize_candidates, reconcile_pending,
-        reconcile_pending_authoritatively, run_with_pending_lifetime, validate, CampaignTask,
-        PendingChallenge, PendingState,
+        available_admissions, campaign_capacity, filter_candidates, randomize_candidates,
+        reconcile_pending, reconcile_pending_authoritatively, run_with_pending_lifetime, validate,
+        validate_incoming_challenge, CampaignCapacity, CampaignTask, PendingChallenge,
+        PendingState,
     };
     use crate::lichess::OutgoingChallenge;
     use crate::models::{CampaignRuntime, CampaignSettings, CampaignStatus, OnlineBot};
@@ -1554,6 +2258,9 @@ mod tests {
             clock_increment: 2,
             rated: false,
             color: "random".into(),
+            accept_incoming_challenges: false,
+            stop_after_minutes: None,
+            stop_after_games: None,
         };
         assert!(validate(&settings).is_ok());
         let candidate = OnlineBot {
@@ -1607,6 +2314,242 @@ mod tests {
     }
 
     #[test]
+    fn incoming_challenges_must_match_every_campaign_rule() {
+        let mut settings = settings();
+        settings.accept_incoming_challenges = true;
+        settings.color = "black".into();
+        let local_accounts = HashSet::from(["other-managed-bot".into()]);
+        let matching = serde_json::json!({
+            "type": "challenge",
+            "compat": { "bot": true },
+            "challenge": {
+                "id": "incoming-1",
+                "direction": "in",
+                "challenger": {
+                    "id": "opponent",
+                    "name": "Opponent",
+                    "rating": 2200,
+                    "provisional": false
+                },
+                "variant": { "key": "standard" },
+                "rated": false,
+                "timeControl": { "type": "clock", "limit": 180, "increment": 2 },
+                "finalColor": "white"
+            }
+        });
+
+        let accepted = validate_incoming_challenge(&matching, &settings, &local_accounts).unwrap();
+        assert_eq!(accepted.id, "incoming-1");
+        assert_eq!(accepted.opponent, "Opponent");
+
+        let mut wrong_clock = matching.clone();
+        wrong_clock["challenge"]["timeControl"]["increment"] = serde_json::json!(3);
+        assert_eq!(
+            validate_incoming_challenge(&wrong_clock, &settings, &local_accounts)
+                .unwrap_err()
+                .lichess_reason,
+            "timeControl"
+        );
+
+        let mut managed = matching;
+        managed["challenge"]["challenger"]["name"] = serde_json::json!("other-managed-bot");
+        assert!(validate_incoming_challenge(&managed, &settings, &local_accounts).is_err());
+    }
+
+    #[tokio::test]
+    async fn accepting_incoming_challenge_persists_ownership_and_uses_capacity() {
+        let http = ScriptedHttp::start().await;
+        http.push(
+            "POST",
+            "/api/challenge/incoming-1/accept",
+            ScriptReply::Json(axum::http::StatusCode::OK, r#"{"ok":true}"#.into()),
+        );
+        let root = temp_root("campaign-accept-incoming");
+        let mut config = app_config("unused-engine", false);
+        let mut campaign_settings = settings();
+        campaign_settings.accept_incoming_challenges = true;
+        config.campaigns.push(campaign_settings);
+        let account = config.accounts[0].clone();
+        let state = AppState::new_with_test_api(
+            root.clone(),
+            config,
+            Arc::new(MemorySecretStore::with("bot", "token")),
+            http.base(),
+        )
+        .unwrap();
+        state.0.campaign_tasks.lock().await.insert(
+            "bot".into(),
+            CampaignTask {
+                generation: 1,
+                cancellation: CancellationToken::new(),
+                handle: None,
+            },
+        );
+        let mut runtime = CampaignRuntime::stopped("bot".into());
+        runtime.status = CampaignStatus::Running;
+        state
+            .0
+            .campaign_runtimes
+            .write()
+            .await
+            .insert("bot".into(), runtime);
+        let event = serde_json::json!({
+            "type": "challenge",
+            "compat": { "bot": true },
+            "challenge": {
+                "id": "incoming-1",
+                "direction": "in",
+                "challenger": {
+                    "id": "opponent",
+                    "name": "Opponent",
+                    "rating": 2200,
+                    "provisional": false
+                },
+                "variant": { "key": "standard" },
+                "rated": false,
+                "timeControl": { "type": "clock", "limit": 180, "increment": 2 },
+                "finalColor": "white"
+            }
+        });
+
+        super::handle_incoming_challenge(&state, &account, "token", &event)
+            .await
+            .unwrap();
+
+        http.wait_for_count("POST", "/api/challenge/incoming-1/accept", 1)
+            .await;
+        let intents =
+            storage::load_active_game_intents(&storage::active_game_intents_path(&root)).unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].account_id, "bot");
+        assert_eq!(intents[0].game_id, "incoming-1");
+        assert_eq!(campaign_capacity(&state, "bot").await.occupied_slots, 1);
+
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn incoming_accept_rate_limit_pauses_campaign_until_lichess_reset() {
+        let http = ScriptedHttp::start().await;
+        http.push(
+            "POST",
+            "/api/challenge/incoming-1/accept",
+            ScriptReply::Json(
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":"You played 100 games against other bots today","ratelimit":{"key":"bot.vsBot.day","seconds":7325}}"#.into(),
+            ),
+        );
+        let root = temp_root("campaign-incoming-rate-limit");
+        let mut config = app_config("unused-engine", false);
+        let mut campaign_settings = settings();
+        campaign_settings.accept_incoming_challenges = true;
+        config.campaigns.push(campaign_settings);
+        let account = config.accounts[0].clone();
+        let state = AppState::new_with_test_api(
+            root.clone(),
+            config,
+            Arc::new(MemorySecretStore::with("bot", "token")),
+            http.base(),
+        )
+        .unwrap();
+        state.0.campaign_tasks.lock().await.insert(
+            "bot".into(),
+            CampaignTask {
+                generation: 1,
+                cancellation: CancellationToken::new(),
+                handle: None,
+            },
+        );
+        let mut runtime = CampaignRuntime::stopped("bot".into());
+        runtime.status = CampaignStatus::Running;
+        state
+            .0
+            .campaign_runtimes
+            .write()
+            .await
+            .insert("bot".into(), runtime);
+        let event = serde_json::json!({
+            "type": "challenge",
+            "compat": { "bot": true },
+            "challenge": {
+                "id": "incoming-1",
+                "direction": "in",
+                "challenger": {
+                    "id": "opponent",
+                    "name": "Opponent",
+                    "rating": 2200,
+                    "provisional": false
+                },
+                "variant": { "key": "standard" },
+                "rated": false,
+                "timeControl": { "type": "clock", "limit": 180, "increment": 2 },
+                "finalColor": "white"
+            }
+        });
+        let before = super::epoch_millis();
+
+        super::handle_incoming_challenge(&state, &account, "token", &event)
+            .await
+            .unwrap();
+
+        let runtimes = state.0.campaign_runtimes.read().await;
+        let runtime = &runtimes["bot"];
+        assert_eq!(runtime.status, CampaignStatus::Backoff);
+        assert!(runtime
+            .next_scan_at
+            .is_some_and(|reset| reset >= before + 7_325_000));
+        drop(runtimes);
+        assert!(state.0.active_intents.lock().await.is_empty());
+
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn game_limit_counts_unstarted_commitments_before_admitting_more() {
+        let mut settings = settings();
+        settings.concurrency = 8;
+        settings.stop_after_games = Some(3);
+
+        assert_eq!(
+            available_admissions(
+                &settings,
+                CampaignCapacity {
+                    occupied_slots: 2,
+                    committed_not_started: 2,
+                    games_started: 1,
+                },
+            ),
+            0
+        );
+        assert_eq!(
+            available_admissions(
+                &settings,
+                CampaignCapacity {
+                    occupied_slots: 1,
+                    committed_not_started: 1,
+                    games_started: 1,
+                },
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn campaign_accepts_only_one_kind_of_automatic_limit() {
+        let mut limited = settings();
+        limited.stop_after_minutes = Some(30);
+        assert!(validate(&limited).is_ok());
+        limited.stop_after_games = Some(10);
+        assert!(validate(&limited).is_err());
+        limited.stop_after_minutes = None;
+        assert!(validate(&limited).is_ok());
+        limited.stop_after_games = Some(0);
+        assert!(validate(&limited).is_err());
+    }
+
+    #[test]
     fn randomizes_with_one_stable_key_per_candidate() {
         let candidates: Vec<_> = (0..512)
             .map(|index| {
@@ -1636,6 +2579,9 @@ mod tests {
             clock_increment: 2,
             rated: false,
             color: "random".into(),
+            accept_incoming_challenges: false,
+            stop_after_minutes: None,
+            stop_after_games: None,
         }
     }
 

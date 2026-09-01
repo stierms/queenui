@@ -27,10 +27,12 @@ function runtime(status: string): CampaignRuntime {
     eligibleBots: 4,
     onlineBotsScanned: 312,
     challengesSent: 7,
+    gamesStarted: 3,
     lastOpponent: null,
     activity: "Scanning",
     error: null,
     nextScanAt: null,
+    stopAt: null,
     events: [],
   };
 }

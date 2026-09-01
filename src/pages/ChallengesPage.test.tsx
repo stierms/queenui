@@ -76,10 +76,12 @@ describe("campaign setup form", () => {
             eligibleBots: 0,
             onlineBotsScanned: 0,
             challengesSent: 0,
+            gamesStarted: 0,
             lastOpponent: null,
             activity: "",
             error: "429 from Lichess",
             nextScanAt: null,
+            stopAt: null,
             events: [],
           },
         ],
@@ -89,6 +91,51 @@ describe("campaign setup form", () => {
     const alert = screen.getByRole("alert");
     expect(alert).toHaveTextContent("Matchmaking reported a problem");
     expect(alert).toHaveTextContent("429 from Lichess");
+  });
+
+  it("sends incoming acceptance and a time limit as campaign settings", async () => {
+    const user = userEvent.setup();
+    const { onStart } = renderPage();
+
+    await user.click(
+      screen.getByRole("switch", {
+        name: "Accept matching incoming challenges",
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Time limit" }));
+    const duration = screen.getByRole("spinbutton", { name: "Run for" });
+    await user.clear(duration);
+    await user.type(duration, "2");
+    await user.click(screen.getByRole("button", { name: "Start matchmaking" }));
+
+    expect(onStart).toHaveBeenCalledWith(
+      expect.objectContaining({
+        acceptIncomingChallenges: true,
+        stopAfterMinutes: 120,
+        stopAfterGames: null,
+      }),
+    );
+  });
+
+  it("sends a game limit without a time limit", async () => {
+    const user = userEvent.setup();
+    const { onStart } = renderPage();
+
+    await user.click(screen.getByRole("button", { name: "Game limit" }));
+    const games = screen.getByRole("spinbutton", {
+      name: "Stop after games started",
+    });
+    await user.clear(games);
+    await user.type(games, "24");
+    await user.click(screen.getByRole("button", { name: "Start matchmaking" }));
+
+    expect(onStart).toHaveBeenCalledWith(
+      expect.objectContaining({
+        acceptIncomingChallenges: false,
+        stopAfterMinutes: null,
+        stopAfterGames: 24,
+      }),
+    );
   });
 });
 
@@ -116,7 +163,12 @@ describe("the rated default", () => {
     // And it is what actually gets sent, not just what is highlighted.
     await user.click(screen.getByRole("button", { name: "Start matchmaking" }));
     expect(onStart).toHaveBeenCalledWith(
-      expect.objectContaining({ rated: true }),
+      expect.objectContaining({
+        rated: true,
+        acceptIncomingChallenges: false,
+        stopAfterMinutes: null,
+        stopAfterGames: null,
+      }),
     );
   });
 
@@ -140,6 +192,9 @@ describe("the rated default", () => {
             clockIncrement: 2,
             rated: false,
             color: "random",
+            acceptIncomingChallenges: false,
+            stopAfterMinutes: null,
+            stopAfterGames: null,
           },
         ],
       },
@@ -171,6 +226,9 @@ describe("the rated default", () => {
             clockIncrement: 3,
             rated: true,
             color: "white",
+            acceptIncomingChallenges: false,
+            stopAfterMinutes: null,
+            stopAfterGames: null,
           },
         ],
       },
@@ -221,10 +279,12 @@ describe("live game count", () => {
       eligibleBots: 0,
       onlineBotsScanned: 0,
       challengesSent: 0,
+      gamesStarted: 0,
       lastOpponent: null,
       activity: "Ready",
       error: null,
       nextScanAt: null,
+      stopAt: null,
       events: [],
     };
   }

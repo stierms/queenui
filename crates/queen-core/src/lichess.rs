@@ -813,6 +813,35 @@ pub async fn cancel_challenge(
     checked(response, "cancel challenge").await.map(|_| ())
 }
 
+pub async fn accept_challenge(
+    base: &Url,
+    client: &Client,
+    token: &str,
+    challenge_id: &str,
+) -> Result<(), LichessError> {
+    let response = request(
+        client,
+        Method::POST,
+        api_url(base, &["challenge", challenge_id, "accept"])?,
+        token,
+    )
+    .send()
+    .await
+    .map_err(|error| LichessError::transport("accept challenge", error, true))?;
+    checked(response, "accept challenge")
+        .await
+        .map_err(|mut error| {
+            // A transport failure is already ambiguous. A server failure can
+            // likewise be returned after committing the accept, so the
+            // durable game intent must remain until account reconciliation.
+            if error.is_server_error() {
+                error.ambiguous_write = true;
+            }
+            error
+        })
+        .map(|_| ())
+}
+
 pub async fn decline_challenge(
     base: &Url,
     client: &Client,
@@ -836,9 +865,9 @@ pub async fn decline_challenge(
 #[cfg(test)]
 mod tests {
     use super::{
-        account, actionable_missing_scope_message, api_url, append_ndjson_chunk, create_challenge,
-        default_api_base, outgoing_challenges, parse_json_retry_after, parse_retry_after, site_url,
-        take_lines, validate_username, LichessErrorKind,
+        accept_challenge, account, actionable_missing_scope_message, api_url, append_ndjson_chunk,
+        create_challenge, default_api_base, outgoing_challenges, parse_json_retry_after,
+        parse_retry_after, site_url, take_lines, validate_username, LichessErrorKind,
     };
     use crate::models::ChallengeRequest;
     use crate::test_support::{ScriptReply, ScriptedHttp};
@@ -1046,6 +1075,40 @@ mod tests {
             error.status,
             Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
         );
+        assert!(error.ambiguous_write);
+    }
+
+    #[tokio::test]
+    async fn accepts_challenges_through_the_bot_api() {
+        let http = ScriptedHttp::start().await;
+        http.push(
+            "POST",
+            "/api/challenge/incoming-1/accept",
+            ScriptReply::Json(reqwest::StatusCode::OK, r#"{"ok":true}"#.into()),
+        );
+
+        accept_challenge(&http.base(), &reqwest::Client::new(), "token", "incoming-1")
+            .await
+            .unwrap();
+        http.wait_for_count("POST", "/api/challenge/incoming-1/accept", 1)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn accept_server_failures_remain_ambiguous_for_reconciliation() {
+        let http = ScriptedHttp::start().await;
+        http.push(
+            "POST",
+            "/api/challenge/incoming-1/accept",
+            ScriptReply::Json(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"committed then failed"}"#.into(),
+            ),
+        );
+
+        let error = accept_challenge(&http.base(), &reqwest::Client::new(), "token", "incoming-1")
+            .await
+            .unwrap_err();
         assert!(error.ambiguous_write);
     }
 

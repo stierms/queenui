@@ -12,7 +12,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+// Campaign scheduling and incoming-challenge acceptance add command semantics
+// that an older runner would silently ignore as unknown JSON fields. Require a
+// matching runner instead of presenting controls that are not enforced.
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const CONTENT_SHA256_HEADER: &str = "x-queenui-content-sha256";
 pub const REQUEST_ID_HEADER: &str = "x-queenui-request-id";
 pub const IDEMPOTENCY_TTL_SECONDS: i64 = 24 * 60 * 60;

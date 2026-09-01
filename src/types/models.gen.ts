@@ -30,11 +30,20 @@ export type CampaignSettings = { accountId: string, minRating: number, maxRating
 /**
  * Defaults to rated matchmaking when absent from persisted backend data.
  */
-rated: boolean, color: string, };
+rated: boolean, color: string,
+/**
+ * Accept compatible incoming challenges while this campaign is active.
+ */
+acceptIncomingChallenges: boolean,
+/**
+ * Mutually exclusive automatic stop conditions. `None` means the run is
+ * stopped manually.
+ */
+stopAfterMinutes: number | null, stopAfterGames: number | null, };
 
 export type CampaignStatus = "starting" | "discovering" | "challenging" | "running" | "waiting" | "backoff" | "stopping" | "stopped" | "error" | "unknown";
 
-export type CampaignRuntime = { accountId: string, status: CampaignStatus, activeGames: number, pendingChallenges: number, eligibleBots: number, onlineBotsScanned: number, challengesSent: number, lastOpponent: string | null, activity: string, error: string | null, nextScanAt: number | null, events: Array<CampaignEvent>, };
+export type CampaignRuntime = { accountId: string, status: CampaignStatus, activeGames: number, pendingChallenges: number, eligibleBots: number, onlineBotsScanned: number, challengesSent: number, gamesStarted: number, lastOpponent: string | null, activity: string, error: string | null, nextScanAt: number | null, stopAt: number | null, events: Array<CampaignEvent>, };
 
 export type AppSnapshot = { engines: Array<EngineProfile>, accounts: Array<AccountProfile>, runtimes: Array<BotRuntime>, games: Array<LiveGame>, campaigns: Array<CampaignSettings>, campaignRuntimes: Array<CampaignRuntime>, };
 

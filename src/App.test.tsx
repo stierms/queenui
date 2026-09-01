@@ -48,10 +48,12 @@ const snapshot: AppSnapshot = {
       eligibleBots: 0,
       onlineBotsScanned: 312,
       challengesSent: 0,
+      gamesStarted: 0,
       lastOpponent: null,
       activity: "Ready",
       error: null,
       nextScanAt: null,
+      stopAt: null,
       events: [
         {
           id: "event-1",

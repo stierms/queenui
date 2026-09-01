@@ -4426,16 +4426,23 @@ mod tests {
             .into_iter()
             .filter(|entry| !diagnostics_before.contains(&entry.id))
             .collect();
-        assert!(new_diagnostics.iter().all(|entry| {
-            entry.level == "warn" && entry.message == "Remote runner event connection failed"
-        }));
-        assert!(new_diagnostics.iter().any(|entry| {
+        // The process-global diagnostics sink is shared by parallel tests.
+        // Assert against this forwarder's records without treating unrelated
+        // runner diagnostics written concurrently as failures of this test.
+        let forwarder_diagnostics: Vec<_> = new_diagnostics
+            .iter()
+            .filter(|entry| entry.message == "Remote runner event connection failed")
+            .collect();
+        assert!(forwarder_diagnostics
+            .iter()
+            .all(|entry| entry.level == "warn"));
+        assert!(forwarder_diagnostics.iter().any(|entry| {
             entry
                 .detail
                 .as_deref()
                 .is_some_and(|detail| detail.contains("closed"))
         }));
-        assert!(new_diagnostics.iter().any(|entry| {
+        assert!(forwarder_diagnostics.iter().any(|entry| {
             entry
                 .detail
                 .as_deref()

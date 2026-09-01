@@ -5,12 +5,13 @@ import {
   CircleDot,
   Crosshair,
   Swords,
+  Timer,
 } from "lucide-react";
 import { EmptyPage } from "../components/EmptyPage";
 import { TimeControlPresets } from "../components/TimeControlPresets";
 import type { BusyKeys } from "../hooks/useActionRunner";
 import { countLiveGames } from "../lib/chess";
-import { durationShortSeconds } from "../lib/format";
+import { durationShortSeconds, timeOfDay } from "../lib/format";
 import {
   defaultSelectedTimeControl,
   timeControlValue,
@@ -22,8 +23,11 @@ import {
   type CampaignSettings,
   type TimeControl,
 } from "../types";
-import { Button } from "../ui/primitives";
+import { Button, Switch } from "../ui/primitives";
 import { schedulerHealthDetail, schedulerHealthTitle } from "./schedulerHealth";
+
+type ScheduleMode = "manual" | "time" | "games";
+type DurationUnit = "minutes" | "hours";
 
 export function ChallengesPage({
   snapshot,
@@ -67,6 +71,11 @@ export function ChallengesPage({
    */
   const [rated, setRated] = useState(true);
   const [color, setColor] = useState("random");
+  const [acceptIncoming, setAcceptIncoming] = useState(false);
+  const [scheduleMode, setScheduleMode] = useState<ScheduleMode>("manual");
+  const [runDuration, setRunDuration] = useState(1);
+  const [durationUnit, setDurationUnit] = useState<DurationUnit>("hours");
+  const [runGames, setRunGames] = useState(10);
   const [now, setNow] = useState(() => Date.now());
 
   // Adjust form state during render when the persisted campaign for the
@@ -81,6 +90,9 @@ export function ChallengesPage({
         saved.clockIncrement,
         saved.rated,
         saved.color,
+        saved.acceptIncomingChallenges,
+        saved.stopAfterMinutes ?? "manual",
+        saved.stopAfterGames ?? "manual",
       ].join(":")
     : `${accountId}:none:${defaultClock}`;
   const [prevSignature, setPrevSignature] = useState<string | null>(null);
@@ -93,6 +105,22 @@ export function ChallengesPage({
       setClock(`${saved.clockLimit / 60}+${saved.clockIncrement}`);
       setRated(saved.rated);
       setColor(saved.color);
+      setAcceptIncoming(saved.acceptIncomingChallenges);
+      if (saved.stopAfterMinutes !== null) {
+        setScheduleMode("time");
+        if (saved.stopAfterMinutes >= 60 && saved.stopAfterMinutes % 60 === 0) {
+          setRunDuration(saved.stopAfterMinutes / 60);
+          setDurationUnit("hours");
+        } else {
+          setRunDuration(saved.stopAfterMinutes);
+          setDurationUnit("minutes");
+        }
+      } else if (saved.stopAfterGames !== null) {
+        setScheduleMode("games");
+        setRunGames(saved.stopAfterGames);
+      } else {
+        setScheduleMode("manual");
+      }
     } else {
       setMinRating(1800);
       setMaxRating(2600);
@@ -102,6 +130,11 @@ export function ChallengesPage({
       // this branch runs when the selected account has no saved campaign.
       setRated(true);
       setColor("random");
+      setAcceptIncoming(false);
+      setScheduleMode("manual");
+      setRunDuration(1);
+      setDurationUnit("hours");
+      setRunGames(10);
     }
   }
 
@@ -139,11 +172,47 @@ export function ChallengesPage({
     (account) => account.id === accountId,
   );
   const [limitMinutes, increment] = clock.split("+").map(Number);
+  const stopAfterMinutes =
+    scheduleMode === "time"
+      ? runDuration * (durationUnit === "hours" ? 60 : 1)
+      : null;
+  const stopAfterGames = scheduleMode === "games" ? runGames : null;
+  const scheduleValid =
+    (scheduleMode !== "time" ||
+      (stopAfterMinutes !== null &&
+        Number.isInteger(stopAfterMinutes) &&
+        stopAfterMinutes >= 1 &&
+        stopAfterMinutes <= 10_080)) &&
+    (scheduleMode !== "games" ||
+      (stopAfterGames !== null &&
+        Number.isInteger(stopAfterGames) &&
+        stopAfterGames >= 1 &&
+        stopAfterGames <= 10_000));
   const configurationValid =
-    minRating >= 0 && maxRating <= 5000 && minRating <= maxRating;
+    minRating >= 0 &&
+    maxRating <= 5000 &&
+    minRating <= maxRating &&
+    scheduleValid;
   const nextScanSeconds = runtime?.nextScanAt
     ? Math.max(0, Math.ceil((runtime.nextScanAt - now) / 1000))
     : null;
+  const stopSeconds = runtime?.stopAt
+    ? Math.max(0, Math.ceil((runtime.stopAt - now) / 1000))
+    : null;
+  const scheduleSummary =
+    scheduleMode === "time"
+      ? `${runDuration} ${durationUnit === "hours" ? (runDuration === 1 ? "hour" : "hours") : runDuration === 1 ? "minute" : "minutes"}`
+      : scheduleMode === "games"
+        ? `${runGames} game${runGames === 1 ? "" : "s"}`
+        : "manual stop";
+  const runLimitDisplay =
+    running && runtime?.stopAt && stopSeconds !== null
+      ? `${timeOfDay(runtime.stopAt)} · ${durationShortSeconds(stopSeconds)} left`
+      : scheduleMode === "games"
+        ? `${runtime?.gamesStarted ?? 0} / ${runGames} games`
+        : scheduleMode === "time"
+          ? scheduleSummary
+          : "Manual stop";
 
   function startMatchmaking() {
     if (!configurationValid || running) return;
@@ -156,6 +225,9 @@ export function ChallengesPage({
       clockIncrement: increment,
       rated,
       color,
+      acceptIncomingChallenges: acceptIncoming,
+      stopAfterMinutes,
+      stopAfterGames,
     });
   }
 
@@ -333,6 +405,105 @@ export function ChallengesPage({
               </div>
             </div>
 
+            <div className="campaign-toggle-row">
+              <div>
+                <strong>Accept matching incoming challenges</strong>
+                <small>
+                  Incoming Bot API challenges must match this campaign’s rating,
+                  clock, mode, and color rules. They use the same capacity and
+                  run limit as outgoing challenges.
+                </small>
+              </div>
+              <Switch
+                checked={acceptIncoming}
+                disabled={running}
+                aria-label="Accept matching incoming challenges"
+                onCheckedChange={setAcceptIncoming}
+              />
+            </div>
+
+            <fieldset className="campaign-schedule" disabled={running}>
+              <legend>Run limit</legend>
+              <div className="segmented campaign-schedule-modes">
+                {(
+                  [
+                    ["manual", "Until stopped"],
+                    ["time", "Time limit"],
+                    ["games", "Game limit"],
+                  ] as const
+                ).map(([mode, label]) => (
+                  <button
+                    type="button"
+                    className={scheduleMode === mode ? "selected" : ""}
+                    aria-pressed={scheduleMode === mode}
+                    key={mode}
+                    onClick={() => setScheduleMode(mode)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {scheduleMode === "time" && (
+                <div className="campaign-limit-editor">
+                  <label>
+                    <span>Run for</span>
+                    <input
+                      type="number"
+                      min="1"
+                      max={durationUnit === "hours" ? 168 : 10_080}
+                      step="1"
+                      value={runDuration}
+                      onChange={(event) =>
+                        setRunDuration(Number(event.target.value))
+                      }
+                    />
+                  </label>
+                  <div className="segmented campaign-duration-units">
+                    {(["minutes", "hours"] as const).map((unit) => (
+                      <button
+                        type="button"
+                        className={durationUnit === unit ? "selected" : ""}
+                        aria-pressed={durationUnit === unit}
+                        key={unit}
+                        onClick={() => {
+                          if (unit === durationUnit) return;
+                          setRunDuration((value) =>
+                            unit === "hours"
+                              ? Math.max(1, Math.ceil(value / 60))
+                              : value * 60,
+                          );
+                          setDurationUnit(unit);
+                        }}
+                      >
+                        {unit}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {scheduleMode === "games" && (
+                <div className="campaign-limit-editor campaign-game-limit">
+                  <label>
+                    <span>Stop after games started</span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="10000"
+                      step="1"
+                      value={runGames}
+                      onChange={(event) =>
+                        setRunGames(Number(event.target.value))
+                      }
+                    />
+                  </label>
+                </div>
+              )}
+              <small className="field-hint">
+                When the limit is reached, QueenUI cancels unanswered outgoing
+                challenges and lets already-started games finish normally.
+              </small>
+            </fieldset>
+
             <div className="campaign-safety">
               <CircleDot size={16} />
               <p>
@@ -350,8 +521,8 @@ export function ChallengesPage({
               {running
                 ? "These settings are locked while matchmaking runs."
                 : configurationValid
-                  ? `Ready: ${minRating}–${maxRating} · ${clock} · ${rated ? "rated" : "casual"} · ${concurrency} slot${concurrency === 1 ? "" : "s"} — start from the Live controller.`
-                  : "Fix the rating range to enable matchmaking."}
+                  ? `Ready: ${minRating}–${maxRating} · ${clock} · ${rated ? "rated" : "casual"} · ${concurrency} slot${concurrency === 1 ? "" : "s"} · ${acceptIncoming ? "incoming + outgoing" : "outgoing only"} · ${scheduleSummary} — start from the Live controller.`
+                  : "Fix the rating range or run limit to enable matchmaking."}
             </p>
           </div>
         </form>
@@ -405,7 +576,8 @@ export function ChallengesPage({
             <div>
               <strong>Occupied slots</strong>
               <small>
-                The scheduler fills empty capacity until you stop it.
+                The scheduler fills empty capacity until the configured run
+                limit is reached.
               </small>
             </div>
           </div>
@@ -442,6 +614,17 @@ export function ChallengesPage({
             <div>
               <span>Sent this run</span>
               <strong>{runtime?.challengesSent ?? 0}</strong>
+            </div>
+            <div>
+              <span>Games this run</span>
+              <strong>{runtime?.gamesStarted ?? 0}</strong>
+            </div>
+            <div>
+              <span>Run limit</span>
+              <strong className="campaign-run-limit">
+                {runtime?.stopAt && running && <Timer size={13} />}
+                {runLimitDisplay}
+              </strong>
             </div>
             <div>
               <span>Next scan</span>

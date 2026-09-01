@@ -186,6 +186,15 @@ pub struct CampaignSettings {
     #[serde(default = "default_campaign_rated")]
     pub rated: bool,
     pub color: String,
+    /// Accept compatible incoming challenges while this campaign is active.
+    #[serde(default)]
+    pub accept_incoming_challenges: bool,
+    /// Mutually exclusive automatic stop conditions. `None` means the run is
+    /// stopped manually.
+    #[serde(default)]
+    pub stop_after_minutes: Option<u32>,
+    #[serde(default)]
+    pub stop_after_games: Option<u32>,
 }
 
 fn default_campaign_rated() -> bool {
@@ -203,6 +212,9 @@ impl Default for CampaignSettings {
             clock_increment: 0,
             rated: default_campaign_rated(),
             color: String::new(),
+            accept_incoming_challenges: false,
+            stop_after_minutes: None,
+            stop_after_games: None,
         }
     }
 }
@@ -217,10 +229,12 @@ pub struct CampaignRuntime {
     pub eligible_bots: u32,
     pub online_bots_scanned: u32,
     pub challenges_sent: u64,
+    pub games_started: u64,
     pub last_opponent: Option<String>,
     pub activity: String,
     pub error: Option<String>,
     pub next_scan_at: Option<u64>,
+    pub stop_at: Option<u64>,
     pub events: Vec<CampaignEvent>,
 }
 
@@ -261,10 +275,12 @@ impl CampaignRuntime {
             eligible_bots: 0,
             online_bots_scanned: 0,
             challenges_sent: 0,
+            games_started: 0,
             last_opponent: None,
             activity: "Ready".into(),
             error: None,
             next_scan_at: None,
+            stop_at: None,
             events: Vec::new(),
         }
     }
