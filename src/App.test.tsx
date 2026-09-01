@@ -49,6 +49,7 @@ const snapshot: AppSnapshot = {
       onlineBotsScanned: 312,
       challengesSent: 0,
       gamesStarted: 0,
+      gamesCompleted: 0,
       lastOpponent: null,
       activity: "Ready",
       error: null,

@@ -28,6 +28,7 @@ function runtime(status: string): CampaignRuntime {
     onlineBotsScanned: 312,
     challengesSent: 7,
     gamesStarted: 3,
+    gamesCompleted: 2,
     lastOpponent: null,
     activity: "Scanning",
     error: null,
@@ -99,6 +100,7 @@ describe("campaign event classes", () => {
       "canceled",
       "accepted",
       "finished",
+      "aborted",
       "error",
     ]) {
       expect(campaignEventClass(kind)).toBe(`event-${kind}`);

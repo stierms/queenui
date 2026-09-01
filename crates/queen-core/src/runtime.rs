@@ -1029,6 +1029,8 @@ impl AppState {
                     task_stopped.cancel();
                     Ok(())
                 })),
+                games: HashSet::new(),
+                settled_games: HashSet::new(),
             },
         );
         let mut runtime = CampaignRuntime::stopped(account_id.to_string());
@@ -3203,6 +3205,12 @@ async fn handle_account_event(
         .lock()
         .await
         .contains(&(account.id.clone(), game_id.clone()));
+    // Track the account event before the spawned per-game stream can deliver
+    // an immediate terminal state. This closes the fast-abort race while the
+    // campaign's settled-id set keeps reconnected duplicates idempotent.
+    if !already_active {
+        campaign::record_account_event(state, &account.id, event_type, &event).await;
+    }
     let result = state
         .spawn_game_task(
             account.clone(),
@@ -3214,9 +3222,6 @@ async fn handle_account_event(
         )
         .await;
     if result.is_ok() {
-        if !already_active {
-            campaign::record_account_event(state, &account.id, event_type, &event).await;
-        }
         let opponent = event
             .pointer("/game/opponent/username")
             .or_else(|| event.pointer("/game/opponent/id"))
@@ -4178,6 +4183,11 @@ async fn process_game_event(
     app.emit_snapshot().await;
     if completed {
         app.remove_active_intent(&account.id, game_id).await?;
+        // The per-game stream is authoritative for terminal status. Campaign
+        // quotas intentionally do not trust the account stream's lighter
+        // `gameFinish` notification, which has historically omitted status in
+        // some edge cases.
+        campaign::record_game_completion(app, &account.id, game_id, &status).await;
         context.telemetry.end_clock_ms = Some(if context.color == "white" {
             white_time
         } else {
@@ -5727,6 +5737,7 @@ mod owned_lifecycle_acceptance_tests {
     use crate::test_support::{
         app_config, temp_root, MemorySecretStore, ScriptReply, ScriptedHttp,
     };
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -7535,6 +7546,8 @@ done
                     stopped.store(true, Ordering::SeqCst);
                     Ok(())
                 })),
+                games: HashSet::new(),
+                settled_games: HashSet::new(),
             },
         );
         state

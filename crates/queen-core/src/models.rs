@@ -193,6 +193,7 @@ pub struct CampaignSettings {
     /// stopped manually.
     #[serde(default)]
     pub stop_after_minutes: Option<u32>,
+    /// Count only terminal, non-aborted games toward the campaign limit.
     #[serde(default)]
     pub stop_after_games: Option<u32>,
 }
@@ -231,6 +232,10 @@ pub struct CampaignRuntime {
     pub challenges_sent: u64,
     #[serde(default)]
     pub games_started: u64,
+    /// Terminal games in this campaign whose Lichess result is not aborted or
+    /// no-start. This is the authoritative counter for a game-limited run.
+    #[serde(default)]
+    pub games_completed: u64,
     pub last_opponent: Option<String>,
     pub activity: String,
     pub error: Option<String>,
@@ -278,6 +283,7 @@ impl CampaignRuntime {
             online_bots_scanned: 0,
             challenges_sent: 0,
             games_started: 0,
+            games_completed: 0,
             last_opponent: None,
             activity: "Ready".into(),
             error: None,

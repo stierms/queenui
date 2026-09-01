@@ -203,13 +203,13 @@ export function ChallengesPage({
     scheduleMode === "time"
       ? `${runDuration} ${durationUnit === "hours" ? (runDuration === 1 ? "hour" : "hours") : runDuration === 1 ? "minute" : "minutes"}`
       : scheduleMode === "games"
-        ? `${runGames} game${runGames === 1 ? "" : "s"}`
+        ? `${runGames} completed game${runGames === 1 ? "" : "s"}`
         : "manual stop";
   const runLimitDisplay =
     running && runtime?.stopAt && stopSeconds !== null
       ? `${timeOfDay(runtime.stopAt)} · ${durationShortSeconds(stopSeconds)} left`
       : scheduleMode === "games"
-        ? `${runtime?.gamesStarted ?? 0} / ${runGames} games`
+        ? `${runtime?.gamesCompleted ?? 0} / ${runGames} completed`
         : scheduleMode === "time"
           ? scheduleSummary
           : "Manual stop";
@@ -484,7 +484,7 @@ export function ChallengesPage({
               {scheduleMode === "games" && (
                 <div className="campaign-limit-editor campaign-game-limit">
                   <label>
-                    <span>Stop after games started</span>
+                    <span>Stop after completed games</span>
                     <input
                       type="number"
                       min="1"
@@ -501,6 +501,7 @@ export function ChallengesPage({
               <small className="field-hint">
                 When the limit is reached, QueenUI cancels unanswered outgoing
                 challenges and lets already-started games finish normally.
+                Aborted and no-start games do not count and are replaced.
               </small>
             </fieldset>
 
@@ -616,8 +617,12 @@ export function ChallengesPage({
               <strong>{runtime?.challengesSent ?? 0}</strong>
             </div>
             <div>
-              <span>Games this run</span>
+              <span>Started this run</span>
               <strong>{runtime?.gamesStarted ?? 0}</strong>
+            </div>
+            <div>
+              <span>Completed this run</span>
+              <strong>{runtime?.gamesCompleted ?? 0}</strong>
             </div>
             <div>
               <span>Run limit</span>

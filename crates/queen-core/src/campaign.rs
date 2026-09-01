@@ -45,6 +45,12 @@ pub(crate) struct CampaignTask {
     pub(crate) generation: u64,
     pub(crate) cancellation: CancellationToken,
     pub(crate) handle: Option<JoinHandle<Result<(), String>>>,
+    /// Games whose `gameStart` was first observed while this exact campaign
+    /// generation was active and which have not reached a terminal state yet.
+    pub(crate) games: HashSet<String>,
+    /// Terminal game ids retained for the campaign generation so duplicate or
+    /// reconnected account/per-game streams cannot count or start them twice.
+    pub(crate) settled_games: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -59,8 +65,7 @@ struct FilterStats {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CampaignCapacity {
     occupied_slots: u32,
-    committed_not_started: u32,
-    games_started: u64,
+    games_completed: u64,
 }
 
 #[derive(Debug)]
@@ -112,6 +117,8 @@ pub(super) async fn start(state: AppState, settings: CampaignSettings) -> Result
                 generation,
                 cancellation: cancellation.clone(),
                 handle: None,
+                games: HashSet::new(),
+                settled_games: HashSet::new(),
             },
         );
     }
@@ -180,6 +187,7 @@ pub(super) async fn start(state: AppState, settings: CampaignSettings) -> Result
             online_bots_scanned: 0,
             challenges_sent: 0,
             games_started: 0,
+            games_completed: 0,
             last_opponent: None,
             activity: "Connecting matchmaking…".into(),
             error: None,
@@ -389,10 +397,10 @@ async fn run_with_pending_lifetime(
         let capacity = campaign_capacity(&state, &settings.account_id).await;
         if settings
             .stop_after_games
-            .is_some_and(|limit| capacity.games_started >= u64::from(limit))
+            .is_some_and(|limit| capacity.games_completed >= u64::from(limit))
         {
             automatic_stop_reason = Some(format!(
-                "The configured {} game limit was reached",
+                "The configured {} completed-game limit was reached",
                 settings.stop_after_games.unwrap_or_default()
             ));
             break;
@@ -624,11 +632,12 @@ async fn run_with_pending_lifetime(
                 runtime.next_scan_at = None;
                 runtime.activity = if settings.stop_after_games.is_some_and(|limit| {
                     capacity
-                        .games_started
-                        .saturating_add(u64::from(capacity.committed_not_started))
+                        .games_completed
+                        .saturating_add(u64::from(capacity.occupied_slots))
                         >= u64::from(limit)
                 }) {
-                    "Game quota committed; waiting for pending games to start".into()
+                    "Completion quota reserved; waiting for active or pending games to finish"
+                        .into()
                 } else {
                     format!(
                         "At capacity: {} game(s), {} pending",
@@ -1290,10 +1299,7 @@ fn campaign_limit_label(settings: &CampaignSettings) -> String {
             if minutes == 1 { "" } else { "s" }
         )
     } else if let Some(games) = settings.stop_after_games {
-        format!(
-            "stop after {games} game{}",
-            if games == 1 { "" } else { "s" }
-        )
+        format!("complete {games} game{}", if games == 1 { "" } else { "s" })
     } else {
         "manual stop".into()
     }
@@ -1329,7 +1335,6 @@ async fn campaign_capacity(state: &AppState, account_id: &str) -> CampaignCapaci
         .collect();
 
     let mut occupied = active_ids.clone();
-    let mut committed_not_started = HashSet::new();
     for challenge_id in known_ids {
         // The write-ahead outgoing reservation intentionally has no server id
         // yet. Give it a collision-free local key so it still consumes one
@@ -1339,29 +1344,22 @@ async fn campaign_capacity(state: &AppState, account_id: &str) -> CampaignCapaci
         } else {
             challenge_id
         };
-        occupied.insert(key.clone());
-        if !active_ids.contains(&key) {
-            committed_not_started.insert(key);
-        }
+        occupied.insert(key);
     }
     for game_id in intent_ids {
-        occupied.insert(game_id.clone());
-        if !active_ids.contains(&game_id) {
-            committed_not_started.insert(game_id);
-        }
+        occupied.insert(game_id);
     }
-    let games_started = state
+    let games_completed = state
         .0
         .campaign_runtimes
         .read()
         .await
         .get(account_id)
-        .map(|runtime| runtime.games_started)
+        .map(|runtime| runtime.games_completed)
         .unwrap_or_default();
     CampaignCapacity {
         occupied_slots: occupied.len().min(u32::MAX as usize) as u32,
-        committed_not_started: committed_not_started.len().min(u32::MAX as usize) as u32,
-        games_started,
+        games_completed,
     }
 }
 
@@ -1370,9 +1368,13 @@ fn available_admissions(settings: &CampaignSettings, capacity: CampaignCapacity)
     let Some(game_limit) = settings.stop_after_games else {
         return slots;
     };
+    // Every active game or not-yet-started challenge reserves one possible
+    // completion. This prevents a concurrent campaign from overshooting its
+    // target, while an aborted/no-start game releases the reservation and is
+    // replaced on the next scan.
     let committed = capacity
-        .games_started
-        .saturating_add(u64::from(capacity.committed_not_started));
+        .games_completed
+        .saturating_add(u64::from(capacity.occupied_slots));
     let game_allowance = u64::from(game_limit)
         .saturating_sub(committed)
         .min(u64::from(u32::MAX)) as u32;
@@ -2026,6 +2028,18 @@ pub(super) async fn record_account_event(
                 .pointer("/game/opponent/username")
                 .or_else(|| event.pointer("/game/opponent/id"))
                 .and_then(Value::as_str);
+            let first_for_campaign = state
+                .0
+                .campaign_tasks
+                .lock()
+                .await
+                .get_mut(account_id)
+                .is_some_and(|task| {
+                    !task.settled_games.contains(game_id) && task.games.insert(game_id.to_string())
+                });
+            if !first_for_campaign {
+                return;
+            }
             update_runtime(state, account_id, |runtime| {
                 runtime.games_started = runtime.games_started.saturating_add(1);
                 runtime.activity = match opponent {
@@ -2047,23 +2061,84 @@ pub(super) async fn record_account_event(
             .await;
             state.emit_snapshot().await;
         }
+        // The per-game stream remains authoritative, but current account
+        // `gameFinish` events also carry a terminal status. Use it as an
+        // idempotent fallback for a game stream that closes at the boundary.
         "gameFinish" => {
             let game_id = event
                 .pointer("/game/gameId")
                 .or_else(|| event.pointer("/game/id"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            record_event(
-                state,
-                account_id,
-                "finished",
-                "Game finished — capacity will refill",
-                Some(format!("Game #{game_id}")),
-            )
-            .await;
+                .and_then(Value::as_str);
+            let status = event.pointer("/game/status").and_then(Value::as_str);
+            if let (Some(game_id), Some(status)) = (game_id, status) {
+                if !matches!(status, "created" | "started") {
+                    record_game_completion(state, account_id, game_id, status).await;
+                }
+            }
         }
         _ => {}
     }
+}
+
+pub(super) async fn record_game_completion(
+    state: &AppState,
+    account_id: &str,
+    game_id: &str,
+    status: &str,
+) {
+    let tracked = state
+        .0
+        .campaign_tasks
+        .lock()
+        .await
+        .get_mut(account_id)
+        .is_some_and(|task| {
+            if task.games.remove(game_id) {
+                task.settled_games.insert(game_id.to_string());
+                true
+            } else {
+                false
+            }
+        });
+    if !tracked {
+        return;
+    }
+
+    let counts_toward_limit = counts_toward_completed_game_limit(status);
+    update_runtime(state, account_id, |runtime| {
+        if counts_toward_limit {
+            runtime.games_completed = runtime.games_completed.saturating_add(1);
+            runtime.activity = format!("Completed game #{}", runtime.games_completed);
+            push_event(
+                runtime,
+                new_event(
+                    "finished",
+                    "Completed game counted",
+                    Some(format!(
+                        "Game #{game_id} · {} completed this run · {status}",
+                        runtime.games_completed
+                    )),
+                ),
+            );
+        } else {
+            runtime.activity =
+                "Aborted game did not count; matchmaking will refill the slot".into();
+            push_event(
+                runtime,
+                new_event(
+                    "aborted",
+                    "Aborted game not counted",
+                    Some(format!("Game #{game_id} · {status}")),
+                ),
+            );
+        }
+    })
+    .await;
+    state.emit_snapshot().await;
+}
+
+fn counts_toward_completed_game_limit(status: &str) -> bool {
+    !matches!(status, "aborted" | "noStart")
 }
 
 async fn record_event(
@@ -2175,9 +2250,9 @@ pub(super) fn validate_clock(limit: u32, increment: u32) -> Result<(), String> {
 mod tests {
     use super::{
         available_admissions, campaign_capacity, filter_candidates, randomize_candidates,
-        reconcile_pending, reconcile_pending_authoritatively, run_with_pending_lifetime, validate,
-        validate_incoming_challenge, CampaignCapacity, CampaignTask, PendingChallenge,
-        PendingState,
+        reconcile_pending, reconcile_pending_authoritatively, record_account_event,
+        record_game_completion, run_with_pending_lifetime, validate, validate_incoming_challenge,
+        CampaignCapacity, CampaignTask, PendingChallenge, PendingState,
     };
     use crate::lichess::OutgoingChallenge;
     use crate::models::{CampaignRuntime, CampaignSettings, CampaignStatus, OnlineBot};
@@ -2383,6 +2458,8 @@ mod tests {
                 generation: 1,
                 cancellation: CancellationToken::new(),
                 handle: None,
+                games: HashSet::new(),
+                settled_games: HashSet::new(),
             },
         );
         let mut runtime = CampaignRuntime::stopped("bot".into());
@@ -2459,6 +2536,8 @@ mod tests {
                 generation: 1,
                 cancellation: CancellationToken::new(),
                 handle: None,
+                games: HashSet::new(),
+                settled_games: HashSet::new(),
             },
         );
         let mut runtime = CampaignRuntime::stopped("bot".into());
@@ -2507,7 +2586,7 @@ mod tests {
     }
 
     #[test]
-    fn game_limit_counts_unstarted_commitments_before_admitting_more() {
+    fn completed_game_limit_reserves_active_and_pending_games_before_admitting_more() {
         let mut settings = settings();
         settings.concurrency = 8;
         settings.stop_after_games = Some(3);
@@ -2517,8 +2596,7 @@ mod tests {
                 &settings,
                 CampaignCapacity {
                     occupied_slots: 2,
-                    committed_not_started: 2,
-                    games_started: 1,
+                    games_completed: 1,
                 },
             ),
             0
@@ -2528,12 +2606,98 @@ mod tests {
                 &settings,
                 CampaignCapacity {
                     occupied_slots: 1,
-                    committed_not_started: 1,
-                    games_started: 1,
+                    games_completed: 1,
                 },
             ),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn campaign_counts_terminal_games_once_and_retries_aborted_games() {
+        let root = temp_root("campaign-completed-game-quota");
+        let state = AppState::new_with_secret_store(
+            root.clone(),
+            app_config("unused-engine", false),
+            Arc::new(MemorySecretStore::with("bot", "token")),
+        )
+        .unwrap();
+        state.0.campaign_tasks.lock().await.insert(
+            "bot".into(),
+            CampaignTask {
+                generation: 1,
+                cancellation: CancellationToken::new(),
+                handle: None,
+                games: HashSet::new(),
+                settled_games: HashSet::new(),
+            },
+        );
+        let mut runtime = CampaignRuntime::stopped("bot".into());
+        runtime.status = CampaignStatus::Running;
+        state
+            .0
+            .campaign_runtimes
+            .write()
+            .await
+            .insert("bot".into(), runtime);
+
+        let completed_start = serde_json::json!({
+            "type": "gameStart",
+            "game": { "gameId": "completed", "opponent": { "username": "MateBot" } }
+        });
+        record_account_event(&state, "bot", "gameStart", &completed_start).await;
+        record_game_completion(&state, "bot", "completed", "mate").await;
+        record_game_completion(&state, "bot", "completed", "mate").await;
+
+        let aborted_start = serde_json::json!({
+            "type": "gameStart",
+            "game": { "gameId": "aborted", "opponent": { "username": "AbortBot" } }
+        });
+        record_account_event(&state, "bot", "gameStart", &aborted_start).await;
+        record_game_completion(&state, "bot", "aborted", "aborted").await;
+
+        let fallback_start = serde_json::json!({
+            "type": "gameStart",
+            "game": { "gameId": "fallback", "opponent": { "username": "StreamCloseBot" } }
+        });
+        record_account_event(&state, "bot", "gameStart", &fallback_start).await;
+        record_account_event(&state, "bot", "gameStart", &fallback_start).await;
+        let fallback_finish = serde_json::json!({
+            "type": "gameFinish",
+            "game": { "gameId": "fallback", "status": "resign" }
+        });
+        record_account_event(&state, "bot", "gameFinish", &fallback_finish).await;
+        record_account_event(&state, "bot", "gameFinish", &fallback_finish).await;
+
+        let no_start = serde_json::json!({
+            "type": "gameStart",
+            "game": { "gameId": "no-start", "opponent": { "username": "NoStartBot" } }
+        });
+        record_account_event(&state, "bot", "gameStart", &no_start).await;
+        let no_start_finish = serde_json::json!({
+            "type": "gameFinish",
+            "game": { "gameId": "no-start", "status": "noStart" }
+        });
+        record_account_event(&state, "bot", "gameFinish", &no_start_finish).await;
+
+        let runtime = state.0.campaign_runtimes.read().await["bot"].clone();
+        assert_eq!(runtime.games_started, 4);
+        assert_eq!(runtime.games_completed, 2);
+        assert!(runtime
+            .events
+            .iter()
+            .any(|event| event.title == "Completed game counted"));
+        assert!(runtime
+            .events
+            .iter()
+            .any(|event| event.title == "Aborted game not counted"));
+        let tasks = state.0.campaign_tasks.lock().await;
+        assert!(tasks["bot"].games.is_empty());
+        assert_eq!(tasks["bot"].settled_games.len(), 4);
+        drop(tasks);
+
+        drop(state);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2915,6 +3079,8 @@ mod tests {
                 generation: 1,
                 cancellation,
                 handle: Some(handle),
+                games: HashSet::new(),
+                settled_games: HashSet::new(),
             },
         );
         http.wait_for_count("GET", "/api/challenge", 1).await;
@@ -3181,6 +3347,8 @@ mod tests {
                 generation: 1,
                 cancellation,
                 handle: Some(handle),
+                games: HashSet::new(),
+                settled_games: HashSet::new(),
             },
         );
         http.wait_for_count("POST", "/api/challenge/public-stop-id/cancel", 1)

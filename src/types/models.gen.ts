@@ -39,11 +39,20 @@ acceptIncomingChallenges: boolean,
  * Mutually exclusive automatic stop conditions. `None` means the run is
  * stopped manually.
  */
-stopAfterMinutes: number | null, stopAfterGames: number | null, };
+stopAfterMinutes: number | null,
+/**
+ * Count only terminal, non-aborted games toward the campaign limit.
+ */
+stopAfterGames: number | null, };
 
 export type CampaignStatus = "starting" | "discovering" | "challenging" | "running" | "waiting" | "backoff" | "stopping" | "stopped" | "error" | "unknown";
 
-export type CampaignRuntime = { accountId: string, status: CampaignStatus, activeGames: number, pendingChallenges: number, eligibleBots: number, onlineBotsScanned: number, challengesSent: number, gamesStarted: number, lastOpponent: string | null, activity: string, error: string | null, nextScanAt: number | null, stopAt: number | null, events: Array<CampaignEvent>, };
+export type CampaignRuntime = { accountId: string, status: CampaignStatus, activeGames: number, pendingChallenges: number, eligibleBots: number, onlineBotsScanned: number, challengesSent: number, gamesStarted: number,
+/**
+ * Terminal games in this campaign whose Lichess result is not aborted or
+ * no-start. This is the authoritative counter for a game-limited run.
+ */
+gamesCompleted: number, lastOpponent: string | null, activity: string, error: string | null, nextScanAt: number | null, stopAt: number | null, events: Array<CampaignEvent>, };
 
 export type AppSnapshot = { engines: Array<EngineProfile>, accounts: Array<AccountProfile>, runtimes: Array<BotRuntime>, games: Array<LiveGame>, campaigns: Array<CampaignSettings>, campaignRuntimes: Array<CampaignRuntime>, };
 

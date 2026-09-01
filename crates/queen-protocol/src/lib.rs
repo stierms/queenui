@@ -18,6 +18,9 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// the protocol version lets a newer desktop retain all existing functionality
 /// with a previously paired runner while refusing only unsupported settings.
 pub const CAMPAIGN_SCHEDULING_FEATURE: &str = "campaign-scheduling-v1";
+/// A game-limited campaign counts terminal non-aborted games and reserves its
+/// remaining quota across active games and pending challenges.
+pub const CAMPAIGN_COMPLETED_GAME_LIMIT_FEATURE: &str = "campaign-completed-game-limit-v1";
 pub const CONTENT_SHA256_HEADER: &str = "x-queenui-content-sha256";
 pub const REQUEST_ID_HEADER: &str = "x-queenui-request-id";
 pub const IDEMPOTENCY_TTL_SECONDS: i64 = 24 * 60 * 60;

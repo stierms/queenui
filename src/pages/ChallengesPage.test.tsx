@@ -77,6 +77,7 @@ describe("campaign setup form", () => {
             onlineBotsScanned: 0,
             challengesSent: 0,
             gamesStarted: 0,
+            gamesCompleted: 0,
             lastOpponent: null,
             activity: "",
             error: "429 from Lichess",
@@ -123,7 +124,7 @@ describe("campaign setup form", () => {
 
     await user.click(screen.getByRole("button", { name: "Game limit" }));
     const games = screen.getByRole("spinbutton", {
-      name: "Stop after games started",
+      name: "Stop after completed games",
     });
     await user.clear(games);
     await user.type(games, "24");
@@ -280,6 +281,7 @@ describe("live game count", () => {
       onlineBotsScanned: 0,
       challengesSent: 0,
       gamesStarted: 0,
+      gamesCompleted: 0,
       lastOpponent: null,
       activity: "Ready",
       error: null,
@@ -331,6 +333,44 @@ describe("live game count", () => {
     );
     expect(document.querySelector(".capacity-ring strong")?.textContent).toBe(
       "0",
+    );
+  });
+
+  it("shows a game-limited run progressing by completed games", () => {
+    const runtime = stoppedRuntime(0);
+    runtime.status = "running";
+    runtime.gamesStarted = 7;
+    runtime.gamesCompleted = 3;
+    renderPage({
+      snapshot: {
+        ...snapshot,
+        campaigns: [
+          {
+            accountId: "queenbot",
+            minRating: 1800,
+            maxRating: 2600,
+            concurrency: 2,
+            clockLimit: 900,
+            clockIncrement: 15,
+            rated: true,
+            color: "random",
+            acceptIncomingChallenges: false,
+            stopAfterMinutes: null,
+            stopAfterGames: 30,
+          },
+        ],
+        campaignRuntimes: [runtime],
+      },
+    });
+
+    expect(
+      screen.getByText("Started this run").parentElement,
+    ).toHaveTextContent("7");
+    expect(
+      screen.getByText("Completed this run").parentElement,
+    ).toHaveTextContent("3");
+    expect(document.querySelector(".campaign-run-limit")).toHaveTextContent(
+      "3 / 30 completed",
     );
   });
 });

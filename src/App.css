@@ -5080,6 +5080,7 @@ kbd {
 }
 .event-idle .event-marker i,
 .event-timeout .event-marker i,
+.event-aborted .event-marker i,
 .event-backoff .event-marker i {
   background: #d9a441;
 }

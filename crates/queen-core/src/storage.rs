@@ -540,6 +540,7 @@ mod tests {
         .expect("deserialize a protocol-v2 campaign runtime");
 
         assert_eq!(runtime.games_started, 0);
+        assert_eq!(runtime.games_completed, 0);
         assert_eq!(runtime.stop_at, None);
     }
 

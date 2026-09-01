@@ -63,6 +63,7 @@ const CAMPAIGN_EVENT_KINDS: ReadonlySet<string> = new Set<CampaignEventKind>([
   "canceled",
   "accepted",
   "finished",
+  "aborted",
   "error",
 ]);
 

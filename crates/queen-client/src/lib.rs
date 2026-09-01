@@ -4,7 +4,8 @@ use queen_protocol::{
     command_body_digest, CommandRequest, CommandResponse, EngineBrowseRequest,
     EngineBrowseResponse, EngineRoot, EventEnvelope, HandoverInventory, PairRedeemRequest,
     PairRedeemResponse, RunnerCapabilities, RunnerCommand, RunnerIdentity, SnapshotResponse,
-    CAMPAIGN_SCHEDULING_FEATURE, CONTENT_SHA256_HEADER, PAIRING_PAYLOAD_VERSION, PROTOCOL_VERSION,
+    CAMPAIGN_COMPLETED_GAME_LIMIT_FEATURE, CAMPAIGN_SCHEDULING_FEATURE, CONTENT_SHA256_HEADER,
+    PAIRING_PAYLOAD_VERSION, PROTOCOL_VERSION,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use rustls::{
@@ -138,17 +139,26 @@ impl RunnerClient {
     }
 
     pub async fn command<T: DeserializeOwned>(&self, command: RunnerCommand) -> Result<T, String> {
-        if let Some(required_feature) = command_required_feature(&command) {
+        let required_features = command_required_features(&command);
+        if !required_features.is_empty() {
             let capabilities = self.capabilities().await?;
-            if !capabilities
-                .features
-                .iter()
-                .any(|feature| feature == required_feature)
-            {
-                return Err(
-                    "Upgrade the paired runner before using incoming challenge acceptance or automatic campaign limits; existing runner features remain available"
-                        .into(),
-                );
+            for required_feature in required_features {
+                if !capabilities
+                    .features
+                    .iter()
+                    .any(|feature| feature == required_feature)
+                {
+                    return Err(match *required_feature {
+                        CAMPAIGN_COMPLETED_GAME_LIMIT_FEATURE => {
+                            "Upgrade the paired runner before using a completed-game campaign limit; existing runner features remain available"
+                                .into()
+                        }
+                        _ => {
+                            "Upgrade the paired runner before using incoming challenge acceptance or automatic campaign limits; existing runner features remain available"
+                                .into()
+                        }
+                    });
+                }
             }
         }
         let request_id = Uuid::new_v4();
@@ -308,16 +318,23 @@ impl RunnerClient {
     }
 }
 
-fn command_required_feature(command: &RunnerCommand) -> Option<&'static str> {
+fn command_required_features(command: &RunnerCommand) -> &'static [&'static str] {
+    const NONE: &[&str] = &[];
+    const SCHEDULING: &[&str] = &[CAMPAIGN_SCHEDULING_FEATURE];
+    const COMPLETED_GAME_LIMIT: &[&str] = &[
+        CAMPAIGN_SCHEDULING_FEATURE,
+        CAMPAIGN_COMPLETED_GAME_LIMIT_FEATURE,
+    ];
     match command {
-        RunnerCommand::StartCampaign { settings }
-            if settings.accept_incoming_challenges
-                || settings.stop_after_minutes.is_some()
-                || settings.stop_after_games.is_some() =>
-        {
-            Some(CAMPAIGN_SCHEDULING_FEATURE)
+        RunnerCommand::StartCampaign { settings } if settings.stop_after_games.is_some() => {
+            COMPLETED_GAME_LIMIT
         }
-        _ => None,
+        RunnerCommand::StartCampaign { settings }
+            if settings.accept_incoming_challenges || settings.stop_after_minutes.is_some() =>
+        {
+            SCHEDULING
+        }
+        _ => NONE,
     }
 }
 
@@ -615,11 +632,12 @@ impl RunnerEventStream {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_required_feature, encode_hex, redeem_pairing_payload, PairingPayload, RunnerClient,
+        command_required_features, encode_hex, redeem_pairing_payload, PairingPayload, RunnerClient,
     };
     use queen_core::models::CampaignSettings;
     use queen_protocol::{
-        RunnerCommand, RunnerIdentity, CAMPAIGN_SCHEDULING_FEATURE, PAIRING_PAYLOAD_VERSION,
+        RunnerCommand, RunnerIdentity, CAMPAIGN_COMPLETED_GAME_LIMIT_FEATURE,
+        CAMPAIGN_SCHEDULING_FEATURE, PAIRING_PAYLOAD_VERSION,
     };
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use rustls::{pki_types::PrivateKeyDer, ServerConfig};
@@ -680,7 +698,7 @@ mod tests {
         let legacy = RunnerCommand::StartCampaign {
             settings: CampaignSettings::default(),
         };
-        assert_eq!(command_required_feature(&legacy), None);
+        assert_eq!(command_required_features(&legacy), &[] as &[&str]);
 
         let settings = CampaignSettings {
             accept_incoming_challenges: true,
@@ -688,8 +706,21 @@ mod tests {
         };
         let incoming = RunnerCommand::StartCampaign { settings };
         assert_eq!(
-            command_required_feature(&incoming),
-            Some(CAMPAIGN_SCHEDULING_FEATURE)
+            command_required_features(&incoming),
+            &[CAMPAIGN_SCHEDULING_FEATURE]
+        );
+
+        let settings = CampaignSettings {
+            stop_after_games: Some(30),
+            ..CampaignSettings::default()
+        };
+        let completed_limit = RunnerCommand::StartCampaign { settings };
+        assert_eq!(
+            command_required_features(&completed_limit),
+            &[
+                CAMPAIGN_SCHEDULING_FEATURE,
+                CAMPAIGN_COMPLETED_GAME_LIMIT_FEATURE,
+            ]
         );
     }
 

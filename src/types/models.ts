@@ -86,6 +86,7 @@ export type CampaignEventKind =
   | "canceled"
   | "accepted"
   | "finished"
+  | "aborted"
   | "error";
 
 /** `>` sent to the engine, `<` received, `!` engine stderr, `#` QueenUI note. */
