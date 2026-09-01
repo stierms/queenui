@@ -153,6 +153,36 @@ describe("engine configuration dialog", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("closes without a discard question after the book policy is saved", async () => {
+    const user = userEvent.setup();
+    const { onClose, onSaveBook } = renderDialog();
+
+    await user.click(screen.getByRole("button", { name: "5%" }));
+    await user.click(screen.getByRole("button", { name: "Save book policy" }));
+    await waitFor(() => expect(onSaveBook).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "Close" }));
+
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText("Discard your changes?")).toBeNull();
+  });
+
+  it("keeps book edits dirty when saving the policy fails", async () => {
+    const user = userEvent.setup();
+    const { onClose, onSaveBook } = renderDialog({
+      onSaveBook: vi.fn(() => Promise.resolve(false)),
+    });
+
+    await user.click(screen.getByRole("button", { name: "5%" }));
+    await user.click(screen.getByRole("button", { name: "Save book policy" }));
+    await waitFor(() => expect(onSaveBook).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "Close" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Discard your changes?" }),
+    ).toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it("confirms before removing a saved opening book", async () => {
     const user = userEvent.setup();
     const { onClearBook } = renderDialog();

@@ -201,6 +201,16 @@ export function EngineConfigurationDialog({
     if (succeeded) setOptionEdits({});
   }
 
+  async function saveBook() {
+    const succeeded = await onSaveBook(engine, {
+      path: bookPath,
+      enabled: bookEnabled,
+      maxPlies,
+      topMovePercent,
+    });
+    if (succeeded) setBookEdits({});
+  }
+
   async function clearBook() {
     const succeeded = await onClearBook(engine);
     if (succeeded) setBookEdits({});
@@ -447,14 +457,7 @@ export function EngineConfigurationDialog({
                     disabled={
                       !bookPath || maxPlies < 1 || savingBook || clearingBook
                     }
-                    onClick={() =>
-                      void onSaveBook(engine, {
-                        path: bookPath,
-                        enabled: bookEnabled,
-                        maxPlies,
-                        topMovePercent,
-                      })
-                    }
+                    onClick={() => void saveBook()}
                   >
                     {savingBook ? "Validating…" : "Save book policy"}
                   </Button>
