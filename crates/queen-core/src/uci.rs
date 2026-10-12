@@ -25,13 +25,16 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const STOP_GRACE: Duration = Duration::from_millis(1500);
 const ENGINE_STDOUT_LINE_CAP: usize = 1024 * 1024;
 const ENGINE_STDERR_LINE_CAP: usize = 64 * 1024;
-/// Extra virtual address space for file-backed maps (Syzygy WDL/DTZ).
-///
-/// `total_memory_mb` is the Hash/RSS budget. Linux `RLIMIT_AS` and Windows Job
-/// `ProcessMemoryLimit` count address space: a 6-piece `.rtbw` is 0.3–2.0 GiB
-/// of VAS even when almost none of it is resident. Using the Hash slice as
-/// `RLIMIT_AS` made `mmap` return ENOMEM while the machine still had free RAM.
-const TABLEBASE_ADDRESS_SPACE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// Private-memory allowance beyond Hash for networks, heap and worker stacks.
+/// Measured zigqueen 6.4.0 peaks at 1,711 MiB above Hash with Threads=2;
+/// see docs/engine-memory-limits.md for measurements and accounting details.
+/// Linux RLIMIT_DATA (since 4.7) excludes shared read-only Syzygy mappings.
+/// Windows Job ProcessMemoryLimit counts committed memory, not address space;
+/// read-only file views do not consume this allowance on either platform.
+const ENGINE_PRIVATE_MEMORY_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Linux accounts the main grow-down stack separately from RLIMIT_DATA.
+#[cfg(target_os = "linux")]
+const ENGINE_STACK_BYTES: u64 = 16 * 1024 * 1024;
 const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "PATHEXT",
@@ -57,8 +60,8 @@ pub(crate) fn unix_time_ms() -> u64 {
 #[derive(Clone, Debug)]
 pub struct EngineLimits {
     pub simultaneous_engines: usize,
-    /// Aggregate Hash/RSS budget. Process address space is this slice plus
-    /// [`TABLEBASE_ADDRESS_SPACE_BYTES`].
+    /// Aggregate Hash budget. Each process also gets a fixed private-memory
+    /// allowance; shared read-only tablebase mappings are not charged.
     pub total_memory_mb: u64,
     pub total_cpu_threads: usize,
     pub total_tasks: usize,
@@ -143,7 +146,7 @@ impl EngineGovernor {
                 per_engine_total: self.limits.output_bytes_per_engine,
                 consumed: Arc::new(AtomicU64::new(0)),
             },
-            address_space_bytes: per_engine_address_space_bytes(&self.limits),
+            private_memory_bytes: per_engine_private_memory_bytes(&self.limits),
             task_limit: (self.limits.total_tasks / self.limits.simultaneous_engines).max(1),
         })
     }
@@ -158,7 +161,7 @@ impl Default for EngineGovernor {
 struct EngineLease {
     _permit: OwnedSemaphorePermit,
     meter: OutputMeter,
-    address_space_bytes: u64,
+    private_memory_bytes: u64,
     task_limit: usize,
 }
 
@@ -170,8 +173,8 @@ fn per_engine_hash_mb(limits: &EngineLimits) -> u64 {
     (limits.total_memory_mb / limits.simultaneous_engines as u64).max(1)
 }
 
-fn per_engine_address_space_bytes(limits: &EngineLimits) -> u64 {
-    per_engine_hash_bytes(limits).saturating_add(TABLEBASE_ADDRESS_SPACE_BYTES)
+fn per_engine_private_memory_bytes(limits: &EngineLimits) -> u64 {
+    per_engine_hash_bytes(limits).saturating_add(ENGINE_PRIVATE_MEMORY_HEADROOM_BYTES)
 }
 
 #[derive(Clone)]
@@ -354,14 +357,9 @@ impl UciEngine {
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Piping stderr obliges us to drain it, or a chatty engine blocks
-            // once the pipe buffer fills. It is only worth piping when there
-            // is a recorder to drain it into.
-            .stderr(if log.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
+            // Always drain stderr: operational warnings must reach diagnostics
+            // even when the optional engine flight recorder is disabled.
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         for (name, value) in allowed_engine_environment() {
             command.env(name, value);
@@ -371,7 +369,7 @@ impl UciEngine {
         {
             use std::os::unix::process::CommandExt;
             command.as_std_mut().process_group(0);
-            let address_space_bytes = lease.address_space_bytes;
+            let private_memory_bytes = lease.private_memory_bytes;
             let task_limit = lease.task_limit;
             let task_ceiling = match current_user_task_count() {
                 Ok(current_tasks) => Some(nproc_ceiling(current_tasks, task_limit)),
@@ -391,11 +389,26 @@ impl UciEngine {
             unsafe {
                 command.as_std_mut().pre_exec(move || {
                     let memory = libc::rlimit {
-                        rlim_cur: address_space_bytes,
-                        rlim_max: address_space_bytes,
+                        rlim_cur: private_memory_bytes,
+                        rlim_max: private_memory_bytes,
                     };
-                    if libc::setrlimit(libc::RLIMIT_AS, &memory) != 0 {
+                    #[cfg(target_os = "linux")]
+                    let memory_resource = libc::RLIMIT_DATA;
+                    // Other Unix kernels do not have Linux's mmap data limit.
+                    #[cfg(not(target_os = "linux"))]
+                    let memory_resource = libc::RLIMIT_AS;
+                    if libc::setrlimit(memory_resource, &memory) != 0 {
                         return Err(std::io::Error::last_os_error());
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        let stack = libc::rlimit {
+                            rlim_cur: ENGINE_STACK_BYTES,
+                            rlim_max: ENGINE_STACK_BYTES,
+                        };
+                        if libc::setrlimit(libc::RLIMIT_STACK, &stack) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                     if let Some(task_ceiling) = task_ceiling {
                         let tasks = libc::rlimit {
@@ -421,7 +434,7 @@ impl UciEngine {
             .spawn()
             .map_err(|error| format!("Could not launch the engine: {error}"))?;
         let process_tree =
-            ProcessTree::attach(&child, lease.address_space_bytes, lease.task_limit)?;
+            ProcessTree::attach(&child, lease.private_memory_bytes, lease.task_limit)?;
         let stdin = child
             .stdin
             .take()
@@ -430,8 +443,7 @@ impl UciEngine {
             .stdout
             .take()
             .ok_or_else(|| "Engine stdout is unavailable".to_string())?;
-        let stderr_task = if let (Some(stderr), Some(recorder)) = (child.stderr.take(), log.clone())
-        {
+        let stderr_task = if let Some(stderr) = child.stderr.take() {
             // Engine stderr carries the diagnostics that never reach the UCI
             // protocol — missing network files, option complaints, panics.
             //
@@ -443,8 +455,11 @@ impl UciEngine {
             // game. Lossy decoding keeps the drain running whatever arrives.
             let meter = lease.meter.clone();
             let violation = output_violation.clone();
+            let recorder = log.clone();
+            let engine_path = path.to_string();
             Some(tokio::spawn(async move {
                 let mut stderr = BufReader::new(stderr);
+                let mut mapping_warning_reported = false;
                 loop {
                     match read_capped_line(&mut stderr, ENGINE_STDERR_LINE_CAP).await {
                         Ok(Some(line)) => {
@@ -452,13 +467,33 @@ impl UciEngine {
                                 violation.cancel();
                                 return;
                             }
-                            recorder
-                                .stderr(&sanitize_engine_output(&String::from_utf8_lossy(&line)));
+                            let line = sanitize_engine_output(&String::from_utf8_lossy(&line));
+                            if let Some(recorder) = &recorder {
+                                recorder.stderr(&line);
+                            }
+                            // One persistent warning per process keeps a failed
+                            // table set from flooding the diagnostics ring.
+                            if !mapping_warning_reported && is_memory_mapping_failure(&line) {
+                                mapping_warning_reported = true;
+                                let mut entry = crate::diagnostics::DiagnosticEntry::warn(
+                                    "engine",
+                                    "Engine memory mapping failed; tablebase probing may be incomplete",
+                                )
+                                .with_detail(format!("Engine: {engine_path}\n{line}"));
+                                if let Some(recorder) = &recorder {
+                                    entry = recorder.contextualize_diagnostic(entry);
+                                }
+                                crate::diagnostics::record(entry);
+                            }
                         }
                         Ok(None) => return,
                         Err(error) => {
-                            recorder
-                                .stderr(&format!("[QueenUI stopped oversized stderr: {error}]"));
+                            if let Some(recorder) = &recorder {
+                                recorder.stderr(&format!(
+                                    "[QueenUI stopped oversized stderr: {error}]"
+                                ));
+                            }
+                            violation.cancel();
                             return;
                         } // An I/O error means the pipe itself is gone; there is
                           // nothing left to drain.
@@ -729,6 +764,28 @@ fn sanitize_engine_output(value: &str) -> String {
         .collect()
 }
 
+fn is_memory_mapping_failure(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    (line.contains("could not map") && line.contains("into memory"))
+        || ((line.contains("mmap")
+            || line.contains("mapviewoffile")
+            || line.contains("createfilemapping")
+            || line.contains("memory map")
+            || line.contains("memory-map"))
+            && [
+                "fail",
+                "error",
+                "cannot",
+                "could not",
+                "unable",
+                "enomem",
+                "out of memory",
+                "cannot allocate memory",
+            ]
+            .iter()
+            .any(|failure| line.contains(failure)))
+}
+
 impl Drop for UciEngine {
     fn drop(&mut self) {
         self.process_tree.terminate();
@@ -899,7 +956,7 @@ struct ProcessTree {
 impl ProcessTree {
     fn attach(
         child: &Child,
-        _address_space_bytes: u64,
+        _private_memory_bytes: u64,
         _task_limit: usize,
     ) -> Result<Self, String> {
         let process_group = child
@@ -935,7 +992,7 @@ unsafe impl Send for ProcessTree {}
 
 #[cfg(windows)]
 impl ProcessTree {
-    fn attach(child: &Child, address_space_bytes: u64, task_limit: usize) -> Result<Self, String> {
+    fn attach(child: &Child, private_memory_bytes: u64, task_limit: usize) -> Result<Self, String> {
         use std::{mem::size_of, ptr};
         use windows_sys::Win32::{
             Foundation::{CloseHandle, HANDLE},
@@ -959,7 +1016,7 @@ impl ProcessTree {
                 | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
             limits.BasicLimitInformation.ActiveProcessLimit =
                 task_limit.min(u32::MAX as usize) as u32;
-            limits.ProcessMemoryLimit = address_space_bytes.min(usize::MAX as u64) as usize;
+            limits.ProcessMemoryLimit = private_memory_bytes.min(usize::MAX as u64) as usize;
             if SetInformationJobObject(
                 job,
                 JobObjectExtendedLimitInformation,
@@ -1001,7 +1058,7 @@ struct ProcessTree;
 impl ProcessTree {
     fn attach(
         _child: &Child,
-        _address_space_bytes: u64,
+        _private_memory_bytes: u64,
         _task_limit: usize,
     ) -> Result<Self, String> {
         Ok(Self)
@@ -1168,11 +1225,10 @@ mod tests {
     #[cfg(unix)]
     use super::nproc_ceiling;
     use super::{
-        allowed_engine_environment, parse_uci_info, parse_uci_option,
-        per_engine_address_space_bytes, per_engine_hash_bytes, per_engine_hash_mb,
-        read_capped_line, sanitize_engine_output, search_watchdog, validate_option_value,
-        EngineGovernor, EngineLimits, UciEngine, ENGINE_ENV_ALLOWLIST,
-        TABLEBASE_ADDRESS_SPACE_BYTES,
+        allowed_engine_environment, parse_uci_info, parse_uci_option, per_engine_hash_bytes,
+        per_engine_hash_mb, per_engine_private_memory_bytes, read_capped_line,
+        sanitize_engine_output, search_watchdog, validate_option_value, EngineGovernor,
+        EngineLimits, UciEngine, ENGINE_ENV_ALLOWLIST, ENGINE_PRIVATE_MEMORY_HEADROOM_BYTES,
     };
     use crate::position::LivePosition;
     #[cfg(unix)]
@@ -1370,7 +1426,7 @@ done
     }
 
     #[test]
-    fn address_space_ceiling_includes_tablebase_headroom_beyond_the_hash_budget() {
+    fn private_memory_ceiling_includes_measured_headroom_beyond_the_hash_budget() {
         let limits = EngineLimits {
             simultaneous_engines: 8,
             total_memory_mb: 16 * 1024,
@@ -1383,21 +1439,254 @@ done
         assert_eq!(per_engine_hash_mb(&limits), 2048);
         assert_eq!(per_engine_hash_bytes(&limits), 2048 * 1024 * 1024);
         assert_eq!(
-            per_engine_address_space_bytes(&limits),
-            2048 * 1024 * 1024 + TABLEBASE_ADDRESS_SPACE_BYTES
+            per_engine_private_memory_bytes(&limits),
+            2048 * 1024 * 1024 + ENGINE_PRIVATE_MEMORY_HEADROOM_BYTES
         );
-        assert!(per_engine_address_space_bytes(&limits) > per_engine_hash_bytes(&limits));
+        assert!(per_engine_private_memory_bytes(&limits) > per_engine_hash_bytes(&limits));
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn tablebase_sized_file_maps_succeed_under_a_tight_hash_budget() {
-        use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn mapping_failures_recognize_fathom_and_platform_errors() {
+        for line in [
+            "Could not map KQvKR.rtbz into memory; continuing without it.",
+            "Could not mmap() KQvKR.rtbw",
+            "mmap: Cannot allocate memory",
+            "mmap returned ENOMEM",
+            "MapViewOfFile() failed, name = KQvKR.rtbw, error = 8",
+            "CreateFileMapping() failed",
+            "Unable to memory-map tablebase",
+        ] {
+            assert!(super::is_memory_mapping_failure(line), "{line}");
+        }
+        for line in [
+            "mmap succeeded",
+            "MapViewOfFile succeeded",
+            "Could not open book file",
+            "info string mapped KQvKR.rtbw into memory",
+        ] {
+            assert!(!super::is_memory_mapping_failure(line), "{line}");
+        }
+    }
 
+    /// Manual integration test: see docs/engine-memory-limits.md. Uses the same
+    /// spawn/limits/stderr drain as live games, but owns only its test child.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a real UCI engine, full six-man Syzygy set and generated positions"]
+    async fn full_syzygy_sweep_under_runner_limits() {
+        use crate::diagnostics;
+        let path = std::env::var("QUEENUI_SYZYGY_TEST_ENGINE").expect("engine executable");
+        let syzygy = std::env::var("QUEENUI_SYZYGY_TEST_PATH").expect("SyzygyPath");
+        let positions = std::fs::read_to_string(
+            std::env::var("QUEENUI_SYZYGY_TEST_POSITIONS").expect("positions TSV"),
+        )
+        .unwrap();
+        let directory = crate::test_support::temp_root("syzygy-sweep");
+        let sink = diagnostics::install(diagnostics::DiagnosticsLog::load(&directory));
+        let mut hash =
+            parse_uci_option("option name Hash type spin default 256 min 1 max 65536").unwrap();
+        hash.value = Some("256".into());
+        let mut threads =
+            parse_uci_option("option name Threads type spin default 1 min 1 max 128").unwrap();
+        threads.value = Some("1".into());
+        let mut tablebase =
+            parse_uci_option("option name SyzygyPath type string default <empty>").unwrap();
+        tablebase.value = Some(syzygy);
+        let governor = EngineGovernor::new(EngineLimits {
+            simultaneous_engines: 8,
+            total_memory_mb: 16384,
+            total_cpu_threads: 16,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut engine =
+            UciEngine::start_governed(&path, &[hash, threads, tablebase], None, &governor)
+                .await
+                .unwrap();
+        assert_eq!(engine.name.as_deref(), Some("zigqueen 6.4.0"));
+        let pid = engine.child.id().unwrap();
+        println!(
+            "ENGINE pid={pid} private-budget={} name={:?}",
+            per_engine_private_memory_bytes(&governor.limits),
+            engine.name
+        );
+        println!(
+            "LIMITS\n{}",
+            std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap()
+        );
+        let mut count = 0;
+        for row in positions.lines() {
+            let (table, fen) = row.split_once('\t').expect("table name and FEN");
+            assert_eq!(table.replace('v', "").len(), 6);
+            LivePosition::parse(fen, "").expect("legal FEN");
+            engine.send(&format!("position fen {fen}")).await.unwrap();
+            engine.send("go depth 1").await.unwrap();
+            let bestmove = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    let line = engine.next_line().await.unwrap();
+                    if line.starts_with("bestmove ") {
+                        break line;
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("search timed out for {table}: {fen}"));
+            assert_ne!(bestmove, "bestmove (none)", "{table}: {fen}");
+            assert_ne!(bestmove, "bestmove 0000", "{table}: {fen}");
+            count += 1;
+            if count % 25 == 0 {
+                println!("PROBED {count} tables");
+            }
+        }
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let vm_size_kib: u64 = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmSize:"))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        let table_maps = maps
+            .lines()
+            .filter(|line| line.ends_with(".rtbw") || line.ends_with(".rtbz"))
+            .count();
+        println!("RESULT tables={count} table-maps={table_maps}\n{status}");
+        engine.shutdown().await;
+        let warnings = sink.recent(&diagnostics::DiagnosticFilter {
+            source: Some("engine".into()),
+            query: Some(path),
+            ..Default::default()
+        });
+        assert!(warnings.is_empty(), "mapping failures: {warnings:?}");
+        assert_eq!(count, 365, "full set of six-man WDL tables");
+        assert!(
+            vm_size_kib > 34 * 1024 * 1024,
+            "VmSize must exceed the former 34 GiB limit"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stderr_mapping_failures_warn_once_with_and_without_a_flight_recorder() {
+        use crate::{diagnostics, enginelog};
+        let directory = crate::test_support::temp_root("stderr-diagnostics");
+        std::fs::create_dir_all(&directory).unwrap();
+        let diagnostics = diagnostics::install(diagnostics::DiagnosticsLog::load(&directory));
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/fake-uci-stderr.rs");
+        let mut fixture = directory.join("fake-uci-stderr");
+        if cfg!(windows) {
+            fixture.set_extension("exe");
+        }
+        assert!(std::process::Command::new("rustc")
+            .args(["--edition=2021", "-o"])
+            .arg(&fixture)
+            .arg(source)
+            .status()
+            .unwrap()
+            .success());
+        let store = enginelog::EngineLogStore::load(&directory, enginelog::LogRetention::default());
+        for capture in [false, true] {
+            let log = capture.then(|| {
+                store
+                    .open_session(enginelog::SessionMeta {
+                        kind: "game".into(),
+                        game_id: Some("mmap-game".into()),
+                        account_id: "mmap-account".into(),
+                        bot_username: "bot".into(),
+                        opponent: None,
+                        opponent_rating: None,
+                        engine_id: "mmap-engine".into(),
+                        engine_name: "StderrProbe".into(),
+                        engine_path: fixture.to_string_lossy().into_owned(),
+                        color: None,
+                        clock: None,
+                        initial_fen: None,
+                        options: vec![],
+                        book: None,
+                        app_version: "test".into(),
+                    })
+                    .unwrap()
+            });
+            let mut engine = UciEngine::start(fixture.to_str().unwrap(), &[], log.clone())
+                .await
+                .unwrap();
+            engine.send("go depth 1").await.unwrap();
+            assert_eq!(engine.next_line().await.unwrap(), "bestmove e2e4");
+            engine.shutdown().await; // Joins the stderr drain before inspecting diagnostics.
+            if let Some(log) = log {
+                let summary = log.finish("test", None).await.unwrap();
+                let page = store.page(&summary.id, 0, 500).unwrap();
+                assert_eq!(
+                    page.lines
+                        .iter()
+                        .filter(|line| line.text.contains("Could not map"))
+                        .count(),
+                    206
+                );
+            }
+        }
+        let warnings = diagnostics.recent(&diagnostics::DiagnosticFilter {
+            source: Some("engine".into()),
+            query: Some(fixture.to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            warnings.len(),
+            2,
+            "one warning per process, even without logging"
+        );
+        for entry in &warnings {
+            assert_eq!(entry.level, "warn");
+            assert!(entry
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("KQvKR\u{fffd}.rtbz"));
+        }
+        assert_eq!(warnings[0].account_id.as_deref(), Some("mmap-account"));
+        assert_eq!(warnings[0].game_id.as_deref(), Some("mmap-game"));
+        assert_eq!(warnings[1].account_id, None);
+
+        // Stderr remains subject to the same line/output limits without logging.
+        let mut engine = UciEngine::start(fixture.to_str().unwrap(), &[], None)
+            .await
+            .unwrap();
+        engine
+            .send("setoption name Oversized value true")
+            .await
+            .unwrap();
+        engine.send("go depth 1").await.unwrap();
+        // Pipe capacity and task scheduling differ on Windows. Wait for the
+        // stderr reader, rather than using stdout as an ordering barrier.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.output_violation.cancelled(),
+        )
+        .await
+        .expect("oversized stderr must trip the output ceiling");
+        engine
+            .ready()
+            .await
+            .expect_err("oversized stderr must cancel engine output");
+        engine.shutdown().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(target_pointer_width = "64", any(target_os = "linux", windows)))]
+    #[tokio::test]
+    async fn shared_200_gib_file_maps_succeed_while_private_allocations_above_budget_fail() {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/fake-uci-mmap.rs");
-        let fixture =
-            std::env::temp_dir().join(format!("queenui-fake-uci-mmap-{}", uuid::Uuid::new_v4()));
+        let directory = crate::test_support::temp_root("memory-limits");
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut fixture = directory.join("fake-uci-mmap");
+        if cfg!(windows) {
+            fixture.set_extension("exe");
+        }
         let compilation = std::process::Command::new("rustc")
             .args(["--edition=2021", "-o"])
             .arg(&fixture)
@@ -1405,9 +1694,8 @@ done
             .status()
             .expect("compile mmap probe engine");
         assert!(compilation.success(), "rustc {source:?} -> {fixture:?}");
-        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // 256 MiB / 8 engines = 32 MiB Hash. The fixture maps 80 MiB.
+        // 256 MiB / 8 engines = 32 MiB Hash plus private-memory headroom.
+        // The fixture maps 200 GiB, faults two pages, then tries private memory.
         let governor = EngineGovernor::new(EngineLimits {
             simultaneous_engines: 8,
             total_memory_mb: 256,
@@ -1418,6 +1706,22 @@ done
             output_bytes_per_engine: 64 * 1024 * 1024,
         })
         .unwrap();
+        // Establish that the same request succeeds without QueenUI's child
+        // ceiling, so global commit exhaustion cannot make the test pass.
+        let budget = per_engine_private_memory_bytes(&governor.limits);
+        let control = std::process::Command::new(&fixture)
+            .args(["--control", &budget.to_string()])
+            .output()
+            .unwrap();
+        assert!(
+            control.status.success(),
+            "unlimited allocation control: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&control.stdout).trim(),
+            "unlimited-control=ok"
+        );
         let mut engine = UciEngine::start_governed(
             fixture.to_str().expect("UTF-8 fixture path"),
             &[],
@@ -1426,13 +1730,32 @@ done
         )
         .await
         .expect("start mmap probe engine");
-        let search = engine
-            .best_move("startpos", "", 10_000, 10_000, 0, 0, |_| {})
+        engine
+            .send(&format!("setoption name Budget value {budget}"))
             .await
-            .expect("search after mapping an 80 MiB file under a 32 MiB Hash budget");
-        assert_eq!(search.best_move, "e2e4");
+            .unwrap();
+        engine
+            .send(&format!(
+                "setoption name Directory value {}",
+                directory.display()
+            ))
+            .await
+            .unwrap();
+        engine.send("go depth 1").await.unwrap();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(10), engine.next_line())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            report.starts_with(
+                "info string file-map=200GiB anonymous-small=ok anonymous-over-budget=denied"
+            ),
+            "{report}"
+        );
+        println!("{report}");
+        assert_eq!(engine.next_line().await.unwrap(), "bestmove e2e4");
         engine.shutdown().await;
-        let _ = std::fs::remove_file(fixture);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

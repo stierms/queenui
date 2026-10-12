@@ -92,12 +92,19 @@ lifecycle changes are owned by per-account actors. Stop/cancel uses the
 actor's priority channel and never acquires normal admission; it signals
 cancellation before bounded joins. Query inputs, rows, response bytes,
 concurrency and wall time are capped. Log export is decoded through a byte cap.
-Engine concurrency, Hash/RSS memory, virtual address space (Hash budget plus a
-fixed tablebase mapping headroom — `RLIMIT_AS` is VAS, not RAM), configured CPU
-threads, descendant
-task count, per-engine and aggregate output rate, per-engine output bytes,
+Engine concurrency, Hash memory, private engine allocations (the Hash slice plus
+2 GiB per process for networks, heap and worker stacks), configured CPU threads,
+descendant task count, per-engine and aggregate output rate, per-engine output bytes,
 stored log bytes, and content-store temporary/installed bytes have server-owned
 ceilings plus a disk free-space reserve. Output controls are sanitized and an
 over-limit engine is killed immediately through process-tree cleanup. Because
 trusted-engine mode has no upload ingress, the reserved upload lane and upload
 temporary-byte use remain zero in production.
+
+On Linux 4.7 and later, `RLIMIT_DATA` limits private writable data mappings and
+the heap; `RLIMIT_STACK` separately bounds the main stack to 16 MiB. Windows Job
+`ProcessMemoryLimit` limits committed memory. Shared read-only tablebase mappings
+consume neither budget; QueenUI does not impose `RLIMIT_AS` on Linux. Mapping
+failures on engine stderr raise one diagnostics warning per process, even with
+engine-log capture disabled. See [engine memory limits](engine-memory-limits.md)
+for measurements and platform regression tests.

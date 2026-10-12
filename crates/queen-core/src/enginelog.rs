@@ -1204,6 +1204,14 @@ fn is_recent(modified: SystemTime) -> bool {
 }
 
 impl LogWriter {
+    /// Associate an engine diagnostic with the flight recorder's game/account.
+    pub(crate) fn contextualize_diagnostic(&self, mut entry: DiagnosticEntry) -> DiagnosticEntry {
+        let summary = lock(&self.shared.summary);
+        entry.account_id = Some(summary.account_id.clone());
+        entry.game_id = summary.game_id.clone();
+        entry
+    }
+
     pub fn sent(&self, text: &str) {
         self.push(SENT, text);
     }
