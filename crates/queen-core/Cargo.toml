@@ -1,6 +1,6 @@
 [package]
 name = "queen-core"
-version = "0.1.5"
+version = "0.1.6"
 description = "Portable QueenUI game, engine, and persistence core"
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -20,7 +20,8 @@ flate2 = "1.1"
 regex = "1.13"
 polyglot-book-rs = "0.1.0"
 shakmaty = "=0.30.0"
-pgn-reader = "0.29.0"
+# Match shakmaty 0.30 and the pinned Rust 1.94.1 toolchain.
+pgn-reader = "=0.29.0"
 rand = "0.9.2"
 fs2 = "0.4"
 httpdate = "1"

@@ -62,6 +62,24 @@ jobs:
       - name: Verify formatting, lints, tests, and builds
         run: just ci
 
+      - name: Package Linux runner
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          just runner-build
+          mkdir -p release-assets/linux-runner
+          cp crates/queen-runner/target/release/queen-runner LICENSE release-assets/linux-runner/
+          cp docs/runner.md docs/engine-memory-limits.md release-assets/linux-runner/
+          tar -czf "release-assets/queen-runner-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C release-assets/linux-runner .
+
+      - name: Upload Linux runner
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: QueenUI-linux-x64-runner
+          path: release-assets/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
   build-windows:
     name: Verify, package, and install on Windows
     runs-on: windows-latest
@@ -128,7 +146,7 @@ jobs:
   release:
     name: Publish tagged release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build-windows
+    needs: [checks-linux, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -138,6 +156,12 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: QueenUI-windows-x64-installers
+          path: release-assets
+
+      - name: Download verified Linux runner
+        uses: actions/download-artifact@v8
+        with:
+          name: QueenUI-linux-x64-runner
           path: release-assets
 
       - name: Create GitHub release
